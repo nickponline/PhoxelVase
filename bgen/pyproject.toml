@@ -1,0 +1,20 @@
+[project]
+name = "bgen"
+version = "0.1.0"
+description = "Procedural pre-fractured destructible building generator"
+requires-python = ">=3.11"
+dependencies = ["numpy", "scipy", "shapely>=2", "mapbox_earcut", "trimesh", "pyyaml",
+                "moderngl", "pillow", "matplotlib", "blake3", "networkx"]
+
+[project.scripts]
+bgen = "bgen.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["bgen*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

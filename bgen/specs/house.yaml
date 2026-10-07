@@ -1,0 +1,5 @@
+# Two-storey brick house with gable or hip roof.
+name: house
+preset: house
+seed: 5
+blockout: {shape: rect, width: [9, 12], depth: [7.5, 9], floors: 2, roof: [gable, hip]}

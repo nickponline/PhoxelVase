@@ -1,0 +1,12 @@
+[build-system]
+requires = ["maturin>=1.5,<2"]
+build-backend = "maturin"
+
+[project]
+name = "rubble"
+dynamic = ["version"]
+requires-python = ">=3.11"
+dependencies = ["numpy"]
+
+[tool.maturin]
+module-name = "rubble"

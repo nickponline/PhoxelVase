@@ -1,0 +1,38 @@
+# Synthetic 3-floor office (12x8 m, floors every 3 m; fixtures/synth_office_3f.bld, written from
+# bgen/tests/synth_building.py: synth_building(floors=3, cell=1.0, seed=0)). Stand-in for a
+# generated building: 24 charges at z=1.5 m blow out the ground-floor walls and columns; the two
+# floors above must come down.
+#   .venv/bin/python -m bgen.sim scenarios/synth_office_columns_out.yaml
+buildings:
+  - {path: ../fixtures/synth_office_3f.bld, pos: [0, 0, 0], yaw: 0}
+steps: 360
+dt: 0.016666
+ground: 0.0
+actions:
+  - {t: 0.5, explode: {center: [1, 1, 1.5], radius: 1.4, inner_radius: 0.8, damage: 10000, impulse: 1000}}
+  - {t: 0.5, explode: {center: [3, 1, 1.5], radius: 1.4, inner_radius: 0.8, damage: 10000, impulse: 1000}}
+  - {t: 0.5, explode: {center: [5, 1, 1.5], radius: 1.4, inner_radius: 0.8, damage: 10000, impulse: 1000}}
+  - {t: 0.5, explode: {center: [7, 1, 1.5], radius: 1.4, inner_radius: 0.8, damage: 10000, impulse: 1000}}
+  - {t: 0.5, explode: {center: [9, 1, 1.5], radius: 1.4, inner_radius: 0.8, damage: 10000, impulse: 1000}}
+  - {t: 0.5, explode: {center: [11, 1, 1.5], radius: 1.4, inner_radius: 0.8, damage: 10000, impulse: 1000}}
+  - {t: 0.5, explode: {center: [1, 3, 1.5], radius: 1.4, inner_radius: 0.8, damage: 10000, impulse: 1000}}
+  - {t: 0.5, explode: {center: [3, 3, 1.5], radius: 1.4, inner_radius: 0.8, damage: 10000, impulse: 1000}}
+  - {t: 0.5, explode: {center: [5, 3, 1.5], radius: 1.4, inner_radius: 0.8, damage: 10000, impulse: 1000}}
+  - {t: 0.5, explode: {center: [7, 3, 1.5], radius: 1.4, inner_radius: 0.8, damage: 10000, impulse: 1000}}
+  - {t: 0.5, explode: {center: [9, 3, 1.5], radius: 1.4, inner_radius: 0.8, damage: 10000, impulse: 1000}}
+  - {t: 0.5, explode: {center: [11, 3, 1.5], radius: 1.4, inner_radius: 0.8, damage: 10000, impulse: 1000}}
+  - {t: 0.5, explode: {center: [1, 5, 1.5], radius: 1.4, inner_radius: 0.8, damage: 10000, impulse: 1000}}
+  - {t: 0.5, explode: {center: [3, 5, 1.5], radius: 1.4, inner_radius: 0.8, damage: 10000, impulse: 1000}}
+  - {t: 0.5, explode: {center: [5, 5, 1.5], radius: 1.4, inner_radius: 0.8, damage: 10000, impulse: 1000}}
+  - {t: 0.5, explode: {center: [7, 5, 1.5], radius: 1.4, inner_radius: 0.8, damage: 10000, impulse: 1000}}
+  - {t: 0.5, explode: {center: [9, 5, 1.5], radius: 1.4, inner_radius: 0.8, damage: 10000, impulse: 1000}}
+  - {t: 0.5, explode: {center: [11, 5, 1.5], radius: 1.4, inner_radius: 0.8, damage: 10000, impulse: 1000}}
+  - {t: 0.5, explode: {center: [1, 7, 1.5], radius: 1.4, inner_radius: 0.8, damage: 10000, impulse: 1000}}
+  - {t: 0.5, explode: {center: [3, 7, 1.5], radius: 1.4, inner_radius: 0.8, damage: 10000, impulse: 1000}}
+  - {t: 0.5, explode: {center: [5, 7, 1.5], radius: 1.4, inner_radius: 0.8, damage: 10000, impulse: 1000}}
+  - {t: 0.5, explode: {center: [7, 7, 1.5], radius: 1.4, inner_radius: 0.8, damage: 10000, impulse: 1000}}
+  - {t: 0.5, explode: {center: [9, 7, 1.5], radius: 1.4, inner_radius: 0.8, damage: 10000, impulse: 1000}}
+  - {t: 0.5, explode: {center: [11, 7, 1.5], radius: 1.4, inner_radius: 0.8, damage: 10000, impulse: 1000}}
+record: {out: runs/synth_office_columns_out/, every: 3}
+render: {camera: iso_ne, size: [960, 720]}
+expect: {collapse: true}

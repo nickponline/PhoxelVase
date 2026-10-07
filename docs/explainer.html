@@ -1,0 +1,710 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Destructible Buildings Explained</title>
+<meta name="description" content="End-to-end explanation of bgen (procedural pre-fractured buildings) and rubble (destruction physics engine), in simplified technical English.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Barlow+Semi+Condensed:wght@600;700&family=Source+Sans+3:ital,wght@0,400;0,600;0,700;1,400&family=JetBrains+Mono:wght@400;500&display=swap">
+<style>
+/* Layout: technical manual - sticky contents rail, one reading column, figures full column width. */
+:root {
+  --font-display: "Barlow Semi Condensed", "Arial Narrow", system-ui, sans-serif;
+  --font-body: "Source Sans 3", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  --bg: #f7f6f2; --panel: #ffffff; --ink: #1f2328; --muted: #5b6270; --line: #dcd8cf;
+  --accent: #2f6db5; --accent-soft: #e4edf8; --warn: #a4501b; --warn-soft: #fbeee4;
+  --ok: #2e7d4f; --code-bg: #efece5; --term: #6a3fa0;
+  --fig-fill: #e9e6df; --fig-ink: #2b2f36; --fig-a: #b8c7d9; --fig-b: #d9cfc1; --fig-c: #c9dfc4; --fig-d: #f2c9b8;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #15171b; --panel: #1d2026; --ink: #e6e3dc; --muted: #a2a8b3; --line: #343841;
+    --accent: #7fb0ea; --accent-soft: #1f2c3d; --warn: #f0a46c; --warn-soft: #3a2a1f;
+    --ok: #7fcf9c; --code-bg: #262a31; --term: #c3a3f0;
+    --fig-fill: #2a2e35; --fig-ink: #dcd8cf; --fig-a: #3b4d63; --fig-b: #4d4436; --fig-c: #34503a; --fig-d: #5a3a2e;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #15171b; --panel: #1d2026; --ink: #e6e3dc; --muted: #a2a8b3; --line: #343841;
+  --accent: #7fb0ea; --accent-soft: #1f2c3d; --warn: #f0a46c; --warn-soft: #3a2a1f;
+  --ok: #7fcf9c; --code-bg: #262a31; --term: #c3a3f0;
+  --fig-fill: #2a2e35; --fig-ink: #dcd8cf; --fig-a: #3b4d63; --fig-b: #4d4436; --fig-c: #34503a; --fig-d: #5a3a2e;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; }
+body { margin: 0; background: var(--bg); color: var(--ink);
+  font: 17px/1.6 var(--font-body); }
+h1, h2, h3 { font-family: var(--font-display); letter-spacing: 0.005em; text-wrap: balance; }
+.pill { letter-spacing: 0.04em; text-transform: uppercase; }
+td, th { font-variant-numeric: tabular-nums; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.wrap { max-width: 1180px; margin: 0 auto; padding: 0 16px; display: grid; grid-template-columns: 1fr; gap: 32px; }
+@media (min-width: 1000px) { .wrap { grid-template-columns: 230px minmax(0, 1fr); } }
+nav.toc { display: none; }
+@media (min-width: 1000px) {
+  nav.toc { display: block; position: sticky; top: calc(env(safe-area-inset-top, 0px) + 16px); align-self: start; max-height: calc(100vh - 32px);
+    overflow: auto; font-size: 14px; padding: 16px 0; }
+  nav.toc a { display: block; color: var(--muted); text-decoration: none; padding: 3px 0; }
+  nav.toc a:hover { color: var(--accent); }
+  nav.toc .sub { padding-left: 12px; }
+}
+main { min-width: 0; padding: 24px 0 80px; }
+header.hero h1 { font-size: clamp(28px, 5vw, 42px); line-height: 1.15; margin: 8px 0 12px; }
+header.hero p.lead { font-size: 19px; color: var(--muted); max-width: 62ch; }
+h2 { font-size: 30px; margin: 56px 0 8px; padding-top: 12px; border-top: 1px solid var(--line); }
+h3 { font-size: 20px; margin: 32px 0 6px; }
+p, li { max-width: 72ch; }
+a { color: var(--accent); }
+code, pre { font: 14px/1.5 var(--font-mono); }
+code { background: var(--code-bg); padding: 1px 5px; border-radius: 4px; }
+pre { background: var(--code-bg); padding: 12px 14px; border-radius: 8px; overflow-x: auto; max-width: 100%; }
+dfn { font-style: normal; font-weight: 650; color: var(--term); }
+.def { display: block; margin: 8px 0 14px; padding: 8px 12px; border-left: 3px solid var(--term);
+  background: var(--panel); border-radius: 0 6px 6px 0; font-size: 15.5px; max-width: 72ch; }
+figure { margin: 20px 0 28px; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 12px; }
+figure img, figure svg { display: block; width: 100%; height: auto; border-radius: 6px; }
+figcaption { font-size: 14.5px; color: var(--muted); margin-top: 8px; }
+.grid2 { display: grid; grid-template-columns: 1fr; gap: 12px; }
+@media (min-width: 700px) { .grid2 { grid-template-columns: 1fr 1fr; } }
+.grid5 { display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; }
+@media (min-width: 700px) { .grid5 { grid-template-columns: repeat(5, 1fr); } }
+.grid5 figure, .grid2 figure { margin: 0; }
+.steps { counter-reset: s; list-style: none; padding: 0; }
+.steps > li { counter-increment: s; position: relative; padding: 2px 0 10px 44px; }
+.steps > li::before { content: counter(s); position: absolute; left: 0; top: 2px; width: 30px; height: 30px;
+  border-radius: 50%; background: var(--accent-soft); color: var(--accent); font-weight: 700;
+  display: flex; align-items: center; justify-content: center; font-size: 15px; }
+.note { background: var(--accent-soft); border-radius: 8px; padding: 10px 14px; margin: 16px 0; max-width: 72ch; }
+.caution { background: var(--warn-soft); border-radius: 8px; padding: 10px 14px; margin: 16px 0; max-width: 72ch; }
+.caution strong { color: var(--warn); }
+.tablewrap { overflow-x: auto; max-width: 100%; }
+table { border-collapse: collapse; font-size: 15px; margin: 12px 0 20px; min-width: 480px; }
+th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { color: var(--muted); font-weight: 600; }
+.pill { display: inline-block; font-size: 12.5px; padding: 1px 8px; border-radius: 999px; background: var(--accent-soft); color: var(--accent); }
+.glossary dt { font-weight: 650; color: var(--term); margin-top: 10px; }
+.glossary dd { margin: 2px 0 0 0; max-width: 72ch; }
+.svgtext { fill: var(--fig-ink); font: 13px var(--font-body); }
+.svgsmall { fill: var(--fig-ink); font: 11.5px var(--font-body); }
+.svgbox { fill: var(--panel); stroke: var(--fig-ink); stroke-width: 1.4; }
+.svgline { stroke: var(--fig-ink); stroke-width: 1.4; fill: none; }
+.toggle { float: right; font-size: 13px; background: var(--panel); color: var(--ink); border: 1px solid var(--line);
+  border-radius: 6px; padding: 4px 10px; cursor: pointer; }
+</style>
+</head>
+<body>
+<div class="wrap">
+<nav class="toc" aria-label="Contents">
+  <strong>Contents</strong>
+  <a href="#what">1. What this is</a>
+  <a href="#big">2. The big picture</a>
+  <a href="#bgen">3. Part 1: make a building</a>
+  <a class="sub" href="#spec">3.1 Spec and seed</a>
+  <a class="sub" href="#blockout">3.2 Blockout</a>
+  <a class="sub" href="#nodes">3.3 Feature nodes</a>
+  <a class="sub" href="#panels">3.4 Panels</a>
+  <a class="sub" href="#fracture">3.5 Fracture</a>
+  <a class="sub" href="#graph">3.6 Connection graph</a>
+  <a class="sub" href="#validate">3.7 Validation</a>
+  <a class="sub" href="#outputs">3.8 Output files</a>
+  <a href="#bld">4. The .bld file</a>
+  <a href="#rubble">5. Part 2: destroy a building</a>
+  <a class="sub" href="#load">5.1 Load</a>
+  <a class="sub" href="#tick">5.2 One tick</a>
+  <a class="sub" href="#damage">5.3 Damage</a>
+  <a class="sub" href="#connect">5.4 Connectivity</a>
+  <a class="sub" href="#stress">5.5 Stress</a>
+  <a class="sub" href="#fall">5.6 Fall and break</a>
+  <a class="sub" href="#settle">5.7 Settle and freeze</a>
+  <a href="#see">6. See the results</a>
+  <a class="sub" href="#gifs">6.1 Collapse animations</a>
+  <a href="#perf">7. Performance</a>
+  <a href="#limits">8. Limits</a>
+  <a href="#run">9. How to run it</a>
+  <a href="#glossary">10. Glossary</a>
+</nav>
+
+<main>
+<button class="toggle" id="themeToggle" type="button" aria-label="Toggle light or dark theme">Theme</button>
+<header class="hero">
+  <span class="pill">the-finals project · explainer</span>
+  <h1>Destructible buildings, from blueprint to rubble</h1>
+  <p class="lead">This page explains the full system, step by step. One program makes buildings that can break. A second program breaks them with bullets and explosions. The text uses simple technical English. Each special term has a definition where it first occurs.</p>
+</header>
+
+<figure>
+  <img src="explainer/img/sheet_office_columns_out.jpg" alt="Six frames of a five-storey office building. Explosions destroy the ground floor. The upper floors fall and break into a pile of rubble.">
+  <figcaption>The result in one picture. Charges destroy the ground floor of a generated office. The four floors above fall and break up. Time goes from left to right, top to bottom (0 s to 8 s).</figcaption>
+</figure>
+
+<!-- ============================================================ -->
+<h2 id="what">1. What this is</h2>
+<p>The video game THE FINALS has buildings that you can destroy completely. Its studio, Embark, makes these buildings with a commercial 3D tool, Houdini, and an in-house tool set, "Building Creator". This project does the same work with free code.</p>
+<p>The project has two parts:</p>
+<ul>
+  <li><strong>bgen</strong> (Python). It makes buildings. Each building comes already cut into small pieces.</li>
+  <li><strong>rubble</strong> (Rust). It is a <dfn>physics engine</dfn>. It moves the pieces and decides when the building breaks.</li>
+</ul>
+<span class="def"><dfn>Physics engine</dfn>: a program that calculates how objects move, fall and hit each other, step by step in time.</span>
+<p>The two parts share one file type, <code>.bld</code>. bgen writes it. rubble reads it.</p>
+<p>This is a single-player demo. It has no network or multiplayer code.</p>
+
+<!-- ============================================================ -->
+<h2 id="big">2. The big picture</h2>
+<p>Read the diagram from left to right. The steps in each box come in order.</p>
+<figure>
+<svg viewBox="0 0 900 300" role="img" aria-label="Pipeline: a spec file goes into bgen, which outputs a .bld file, images and a manifest. The .bld file goes into rubble, which drives the viewer, the scenario runner and the Python bindings.">
+  <defs><marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--fig-ink)"/></marker></defs>
+  <rect class="svgbox" x="10" y="110" width="120" height="70" rx="8"/>
+  <text class="svgtext" x="70" y="140" text-anchor="middle">spec.yaml</text>
+  <text class="svgsmall" x="70" y="160" text-anchor="middle">+ seed number</text>
+  <line class="svgline" x1="130" y1="145" x2="170" y2="145" marker-end="url(#ar)"/>
+  <rect x="170" y="40" width="250" height="215" rx="10" fill="var(--fig-a)" stroke="var(--fig-ink)"/>
+  <text class="svgtext" x="295" y="64" text-anchor="middle" font-weight="700">bgen (Python)</text>
+  <text class="svgsmall" x="190" y="92">1. blockout (rough shape)</text>
+  <text class="svgsmall" x="190" y="114">2. feature nodes (walls, rooms…)</text>
+  <text class="svgsmall" x="190" y="136">3. panels (flat parts)</text>
+  <text class="svgsmall" x="190" y="158">4. fracture (cut into chunks)</text>
+  <text class="svgsmall" x="190" y="180">5. connection graph</text>
+  <text class="svgsmall" x="190" y="202">6. validate + stability check</text>
+  <text class="svgsmall" x="190" y="224">7. export + render images</text>
+  <line class="svgline" x1="420" y1="145" x2="480" y2="145" marker-end="url(#ar)"/>
+  <rect class="svgbox" x="480" y="105" width="110" height="80" rx="8"/>
+  <text class="svgtext" x="535" y="138" text-anchor="middle">building.bld</text>
+  <text class="svgsmall" x="535" y="158" text-anchor="middle">one binary file</text>
+  <line class="svgline" x1="590" y1="145" x2="640" y2="145" marker-end="url(#ar)"/>
+  <rect x="640" y="40" width="250" height="215" rx="10" fill="var(--fig-d)" stroke="var(--fig-ink)"/>
+  <text class="svgtext" x="765" y="64" text-anchor="middle" font-weight="700">rubble (Rust)</text>
+  <text class="svgsmall" x="660" y="92">load chunks as static objects</text>
+  <text class="svgsmall" x="660" y="114">60 times per second:</text>
+  <text class="svgsmall" x="672" y="136">damage → connectivity → stress</text>
+  <text class="svgsmall" x="672" y="158">→ fall → break → settle</text>
+  <text class="svgsmall" x="660" y="190">used by: viewer · scenario runner</text>
+  <text class="svgsmall" x="660" y="210">· Python bindings</text>
+  <path class="svgline" d="M765,255 C765,290 295,290 295,258" stroke-dasharray="5 4" marker-end="url(#ar)"/>
+  <text class="svgsmall" x="530" y="283" text-anchor="middle">bgen asks rubble: "does this building stand?"</text>
+  <text class="svgsmall" x="535" y="225" text-anchor="middle">also: .glb, manifest.json,</text>
+  <text class="svgsmall" x="535" y="241" text-anchor="middle">renders/*.png</text>
+</svg>
+<figcaption>Figure 1. Data flow. The dashed arrow shows a loop back: bgen uses rubble's stress calculation to check that each new building can hold its own weight.</figcaption>
+</figure>
+
+<!-- ============================================================ -->
+<h2 id="bgen">3. Part 1: make a building (bgen)</h2>
+<p>bgen does the job of Houdini plus Building Creator. It needs no 3D program. It runs from a command line.</p>
+<div class="grid5">
+  <figure><img src="explainer/img/preset_house_1.jpg" alt="Two-storey brick house with a pitched roof"><figcaption>house</figcaption></figure>
+  <figure><img src="explainer/img/preset_kyoto_1.jpg" alt="Low wooden building with a curved Japanese roof"><figcaption>kyoto</figcaption></figure>
+  <figure><img src="explainer/img/preset_warehouse_1.jpg" alt="Single-storey warehouse"><figcaption>warehouse</figcaption></figure>
+  <figure><img src="explainer/img/preset_apartment_1.jpg" alt="Brick apartment block with balconies"><figcaption>apartment</figcaption></figure>
+  <figure><img src="explainer/img/preset_tower_1.jpg" alt="Ten-storey concrete tower"><figcaption>tower</figcaption></figure>
+</div>
+<p style="font-size:15px;color:var(--muted)">Five of the six <dfn>presets</dfn>. The sixth preset is "office" (shown in the large images on this page).</p>
+<span class="def"><dfn>Preset</dfn>: a set of default values for one type of building, for example floor height, materials, window style and room types.</span>
+
+<h3 id="spec">3.1 Start with a spec and a seed</h3>
+<p>You describe a building in a <dfn>spec</dfn> file. The file uses <dfn>YAML</dfn>.</p>
+<span class="def"><dfn>Spec</dfn> (specification): a short text file that tells bgen what to make. <dfn>YAML</dfn>: a plain-text format for settings, with one "key: value" per line.</span>
+<p>A spec can give exact values or ranges. For a range, for example <code>floors: [8, 15]</code>, bgen picks a value. A <dfn>seed</dfn> controls these choices.</p>
+<span class="def"><dfn>Seed</dfn>: a whole number that starts the random number generator. The same spec and the same seed always give the same building, byte for byte.</span>
+<pre>name: building4
+preset: tower
+blockout:
+  - {footprint: [[0,0],[40,0],[40,32],[0,32]], floors: 4}    # podium
+  - {footprint: [[7,3],[33,3],[33,29],[7,29]], floors: 40}   # main shaft
+  - {footprint: [[10,6],[30,6],[30,26],[10,26]], floors: 48} # setback
+  - {footprint: [[14,10],[26,10],[26,22],[14,22]], floors: 52} # crown
+nodes:
+  - floors: {}
+  - exterior_walls: {bay_width: [3.0, 3.6]}
+  - columns: {grid: 6.0, size: 0.8}
+  - rooms: {min_room: 14.0}
+  - stairs: {cores: 1}
+  - openings: {windows: {style: ribbon}}
+  - roofs: {flat: {parapet: 1.2}}</pre>
+<p style="font-size:15px;color:var(--muted)">Part of <code>bgen/specs/building4.yaml</code>, a 52-storey tower.</p>
+
+<h3 id="blockout">3.2 Make the blockout</h3>
+<p>The first step makes the <dfn>blockout</dfn>.</p>
+<span class="def"><dfn>Blockout</dfn>: the rough shape of the building, with no walls or windows. Here it is a list of <dfn>masses</dfn>. A mass is a <dfn>footprint</dfn> (the outline on the ground, seen from above) and a number of floors.</span>
+<ol class="steps">
+  <li>bgen reads each mass.</li>
+  <li>For each floor level, bgen joins all masses that reach that level. The result is the floor outline for that level.</li>
+  <li>bgen finds the straight outside edges of each floor outline. These edges are the <dfn>facades</dfn> (the outside faces of the building).</li>
+</ol>
+<div class="grid2">
+  <figure><img src="explainer/img/blockout_building4.png" alt="Plan and elevation of four nested rectangles: podium, shaft, setback and crown"><figcaption>Figure 2. The 4 masses of building4. The masses overlap. Each higher mass is smaller.</figcaption></figure>
+  <figure><img src="explainer/img/building4_iso.jpg" alt="Rendered 52-storey tower on a wide 4-storey podium"><figcaption>Figure 3. The finished building4: 52 floors, 188 m, 38,585 chunks.</figcaption></figure>
+</div>
+
+<h3 id="nodes">3.3 Add features with feature nodes</h3>
+<p>Next, bgen runs a chain of <dfn>feature nodes</dfn>. This copies the design of Building Creator.</p>
+<span class="def"><dfn>Feature node</dfn>: a small function that adds one type of architectural part. All nodes have the same inputs and outputs. Each node receives the building so far and returns it with its new parts added.</span>
+<div class="tablewrap"><table>
+<tr><th>Node</th><th>What it adds</th></tr>
+<tr><td>floors</td><td>One concrete <dfn>slab</dfn> (flat floor plate) per floor.</td></tr>
+<tr><td>exterior_walls</td><td>Outside walls. It divides each facade into <dfn>bays</dfn> (vertical strips, 3–4.5 m wide). Windows align with the bays.</td></tr>
+<tr><td>columns</td><td>Vertical posts on a regular grid, and at corners.</td></tr>
+<tr><td>rooms</td><td>Divides each floor into rooms with <dfn>BSP</dfn>. Adds inside walls and a name for each room (office, meeting, corridor…).</td></tr>
+<tr><td>stairs</td><td>A stair core that goes through all floors. It cuts holes in the slabs above.</td></tr>
+<tr><td>openings</td><td>Cuts windows and doors into the walls. Adds a glass pane in each window. Makes sure that a person can reach every room.</td></tr>
+<tr><td>roofs</td><td>Flat roofs with a low edge wall (<dfn>parapet</dfn>), or pitched roofs (gable, hip, kyoto).</td></tr>
+<tr><td>balconies</td><td>Slabs that stick out from the facade (<dfn>cantilevers</dfn>), with a parapet.</td></tr>
+<tr><td>manual</td><td>Your own changes from a file: add, move or delete a part. The changes stay after you make the building again.</td></tr>
+</table></div>
+<span class="def"><dfn>BSP</dfn> (binary space partition): cut an area in two, then cut each half in two again, until each part has the correct size. <dfn>Cantilever</dfn>: a part that has support at one end only.</span>
+<div class="grid2">
+  <figure><img src="explainer/img/office_cutaway_floor_1.jpg" alt="Cutaway of an office floor showing rooms, inside walls, columns and a stair"><figcaption>Figure 4. Cutaway of floor 1 of an office. You can see rooms, doors, columns and the stair core.</figcaption></figure>
+  <figure><img src="explainer/img/office_plan_floor_1.jpg" alt="Floor plan with colored rooms and labels"><figcaption>Figure 5. The floor plan of the same floor. Colors show room types. Gaps in walls are doors.</figcaption></figure>
+</div>
+
+<h3 id="panels">3.4 Every part is a panel</h3>
+<p>Every wall, slab, column, roof plane and stair is a <dfn>panel</dfn>. This is the most important idea in bgen.</p>
+<span class="def"><dfn>Panel</dfn>: a flat 2D outline (the <dfn>profile</dfn>) plus a thickness. bgen pushes the profile out by the thickness to make a solid. This operation is called <dfn>extrusion</dfn>.</span>
+<figure>
+<svg viewBox="0 0 900 230" role="img" aria-label="A flat wall outline with two window holes becomes a solid wall by extrusion. A second diagram shows the junction rules: slabs run through, walls sit between slabs.">
+  <defs><marker id="ar2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--fig-ink)"/></marker></defs>
+  <text class="svgtext" x="20" y="22" font-weight="700">A. Profile + thickness = solid</text>
+  <path d="M20,60 H230 V170 H20 Z M50,85 H100 V130 H50 Z M140,85 H190 V130 H140 Z" fill="var(--fig-fill)" stroke="var(--fig-ink)" fill-rule="evenodd"/>
+  <text class="svgsmall" x="125" y="190" text-anchor="middle">2D profile (holes = windows)</text>
+  <line class="svgline" x1="245" y1="115" x2="290" y2="115" marker-end="url(#ar2)"/>
+  <text class="svgsmall" x="267" y="105" text-anchor="middle">extrude</text>
+  <path d="M300,75 l25,-20 h210 l-25,20 z" fill="var(--fig-b)" stroke="var(--fig-ink)"/>
+  <path d="M510,75 l25,-20 v110 l-25,20 z" fill="var(--fig-a)" stroke="var(--fig-ink)"/>
+  <path d="M300,75 H510 V185 H300 Z M330,100 H380 V145 H330 Z M420,100 H470 V145 H420 Z" fill="var(--fig-fill)" stroke="var(--fig-ink)" fill-rule="evenodd"/>
+  <text class="svgsmall" x="405" y="205" text-anchor="middle">solid wall, thickness 0.3 m</text>
+  <text class="svgtext" x="600" y="22" font-weight="700">B. Junction rules (side view)</text>
+  <rect x="600" y="50" width="270" height="14" fill="var(--fig-a)" stroke="var(--fig-ink)"/>
+  <rect x="600" y="140" width="270" height="14" fill="var(--fig-a)" stroke="var(--fig-ink)"/>
+  <rect x="610" y="64" width="16" height="76" fill="var(--fig-d)" stroke="var(--fig-ink)"/>
+  <rect x="844" y="64" width="16" height="76" fill="var(--fig-d)" stroke="var(--fig-ink)"/>
+  <rect x="726" y="64" width="10" height="76" fill="var(--fig-c)" stroke="var(--fig-ink)"/>
+  <text class="svgsmall" x="735" y="45" text-anchor="middle">slab (runs full width)</text>
+  <text class="svgsmall" x="735" y="175" text-anchor="middle">walls sit between slabs; no overlap</text>
+  <text class="svgsmall" x="735" y="192" text-anchor="middle">every contact is a flat face-to-face touch</text>
+</svg>
+<figcaption>Figure 6. (A) A panel is a profile plus a thickness. (B) Junction rules control where panels meet. Slabs go through. Walls fit between them. Thus no two panels overlap, and every contact is exact.</figcaption>
+</figure>
+<p>This method has three advantages:</p>
+<ul>
+  <li>Each solid is <dfn>watertight</dfn>: its surface is closed, with no gaps.</li>
+  <li>Holes for windows and doors are simple 2D cuts.</li>
+  <li>The difficult 3D problems become easier 2D problems.</li>
+</ul>
+
+<h3 id="fracture">3.5 Pre-fracture: cut each panel into chunks</h3>
+<p>bgen cuts the building into pieces before the game starts. This is <dfn>pre-fracture</dfn>. THE FINALS uses the same method, because cutting objects during play is slow and unpredictable.</p>
+<span class="def"><dfn>Chunk</dfn>: one small piece of a panel. A chunk is the smallest part that can break off. An office has about 5,000 chunks.</span>
+<p>Every chunk must be <dfn>convex</dfn>. Physics engines can test collisions between convex shapes quickly and reliably.</p>
+<span class="def"><dfn>Convex</dfn>: a shape with no dents or holes. A straight line between any two points inside the shape stays inside the shape. A square is convex. An "L" shape is not.</span>
+<p>bgen does these steps for each panel:</p>
+<ol class="steps">
+  <li><strong>Convex decomposition.</strong> Cut the profile into convex parts. bgen divides the profile into triangles, then joins triangles while the result stays convex.</li>
+  <li><strong>Seed points.</strong> Scatter random points on the profile. The material sets the distance between points (concrete about 0.9–2 m, brick 0.6–1.5 m).</li>
+  <li><strong>Voronoi cells.</strong> Make one <dfn>Voronoi cell</dfn> around each point.</li>
+  <li><strong>Clip.</strong> Intersect each convex part with each cell. The intersection of two convex shapes is always convex. Thus every result is convex.</li>
+  <li><strong>Clean up.</strong> Join very small or thin pieces to a neighbor.</li>
+  <li><strong>Extrude.</strong> Give each 2D piece the thickness of the panel. The result is a <dfn>convex prism</dfn>.</li>
+</ol>
+<span class="def"><dfn>Voronoi cell</dfn>: the area that is nearer to one seed point than to all other seed points. The cells together look like cracked mud. <dfn>Convex prism</dfn>: a convex 2D shape pushed straight out into 3D, like a coin or a brick.</span>
+<figure>
+  <img src="explainer/img/fracture_steps.png" alt="Four steps: a wall outline with two window holes and a door; the outline cut into seven convex parts; random points with Voronoi cells; the final 67 colored chunks">
+  <figcaption>Figure 7. The 4 steps on one real 12 m × 3.4 m concrete wall. The bottom image is the real output of bgen (67 chunks).</figcaption>
+</figure>
+<p>Each chunk is three things at the same time:</p>
+<ul>
+  <li>the <strong>mesh</strong> that you see (its triangles),</li>
+  <li>the <strong>collision shape</strong> that the physics engine uses (the same convex prism),</li>
+  <li>a <strong>mass</strong>. bgen calculates the mass, the <dfn>center of mass</dfn> and the <dfn>inertia</dfn> from the material density.</li>
+</ul>
+<span class="def"><dfn>Center of mass</dfn>: the point where the object balances. <dfn>Inertia</dfn>: how hard it is to make the object turn.</span>
+<p>Glass panes are not cut. Each pane is one chunk. The engine breaks it into particles when anything hits it.</p>
+<div class="grid2">
+  <figure><img src="explainer/img/office_fractured_iso.jpg" alt="Office building with every chunk in a different pastel color"><figcaption>Figure 8. Every chunk has a random color. This office has 5,398 chunks.</figcaption></figure>
+  <figure><img src="explainer/img/office_exploded.jpg" alt="Exploded view: chunks pushed apart so the inside slabs and walls are visible"><figcaption>Figure 9. Exploded view. bgen pushes the chunks apart to show the inside of the building.</figcaption></figure>
+</div>
+
+<h3 id="graph">3.6 Connect the chunks: the connection graph</h3>
+<p>Next, bgen finds which chunks touch. It records this in a <dfn>connection graph</dfn>.</p>
+<span class="def"><dfn>Graph</dfn>: a set of points (<dfn>nodes</dfn>) and lines between them (<dfn>edges</dfn>). Here each node is a chunk. Each edge is a contact between two chunks. People also call an edge a <dfn>bond</dfn> or a <dfn>joint</dfn>.</span>
+<p>For each edge, bgen records:</p>
+<ul>
+  <li>the <strong>contact area</strong> (in m²),</li>
+  <li>the <strong>contact center</strong> and the <strong>direction</strong> of the contact,</li>
+  <li>the <strong>strength</strong>: contact area × material bond strength. The unit is newtons (N), a unit of force.</li>
+</ul>
+<div class="tablewrap"><table>
+<tr><th>Material</th><th>Density (kg/m³)</th><th>Bond strength (MPa = million N/m²)</th><th>Structural?</th></tr>
+<tr><td>concrete</td><td>2400</td><td>8</td><td>yes</td></tr>
+<tr><td>brick</td><td>1900</td><td>5</td><td>yes</td></tr>
+<tr><td>wood</td><td>600</td><td>3</td><td>yes</td></tr>
+<tr><td>metal (steel)</td><td>7800</td><td>20</td><td>yes</td></tr>
+<tr><td>glass</td><td>2500</td><td>0</td><td>no (carries no load)</td></tr>
+</table></div>
+<p>A bond between two different materials has 70% of the strength of the weaker material.</p>
+<p>Chunks that touch the ground are <dfn>anchors</dfn>.</p>
+<span class="def"><dfn>Anchor</dfn>: a chunk that is fixed to the ground. All weight must flow down to the anchors. A chunk with no path to an anchor will fall.</span>
+<figure>
+  <img src="explainer/img/office_graph.jpg" alt="Office building drawn as thousands of colored lines between chunk centers, with red squares at the ground">
+  <figcaption>Figure 10. The connection graph of the office: 16,932 edges. Color shows bond strength. Red squares are anchors (212).</figcaption>
+</figure>
+
+<h3 id="validate">3.7 Validate the building, and make sure it stands</h3>
+<p>bgen checks every building before it saves it. A failed check stops the build with an error report.</p>
+<ol class="steps">
+  <li><strong>Geometry checks.</strong> Every chunk is convex and watertight. No two chunks overlap. The chunk volumes of each panel add up to the panel volume.</li>
+  <li><strong>Connectivity check.</strong> Every structural chunk has a path to an anchor.</li>
+  <li><strong>Room check.</strong> A person can reach every room through doors and stairs.</li>
+  <li><strong>Stability check.</strong> bgen asks rubble's stress solver: "Can the undamaged building hold its own weight?" (See <a href="#stress">5.5</a>.) Each edge gets a <dfn>utilization</dfn>.</li>
+  <li><strong>Reinforcement.</strong> If an edge has utilization of 0.5 or more, bgen makes that edge stronger, then checks again. This is like adding steel bars to concrete. bgen repeats this up to 8 times.</li>
+</ol>
+<span class="def"><dfn>Utilization</dfn>: load on an edge ÷ strength of the edge. 0.2 means "20% of its limit". 1.0 or more means "it breaks". The target for a new building is less than 0.5, so the building has a safety margin.</span>
+<figure>
+  <img src="explainer/img/office_stress.jpg" alt="Connection graph colored green everywhere, showing low utilization; maximum 0.29">
+  <figcaption>Figure 11. Stress check of the undamaged office. All edges are green. The highest utilization is 0.29, so the building passes.</figcaption>
+</figure>
+<div class="note">A very tall building cannot always reach 0.5. For building4 (52 floors), the spec sets <code>stability: {accept_util: 0.8}</code>. bgen still reinforces toward 0.5, but accepts a result below 0.8. Building4 reaches 0.75.</div>
+
+<h3 id="outputs">3.8 Save the output files</h3>
+<p>bgen writes one folder per building, for example <code>assets/buildings/office_1/</code>:</p>
+<div class="tablewrap"><table>
+<tr><th>File</th><th>Contents</th></tr>
+<tr><td><code>building.bld</code></td><td>Everything the engine needs, in one binary file. See section 4.</td></tr>
+<tr><td><code>building.glb</code></td><td>The meshes in <dfn>glTF</dfn> format, one node per chunk. Use it to look at the building in other 3D programs.</td></tr>
+<tr><td><code>manifest.json</code></td><td>The spec, the seed, statistics, the room list, timings and the validation report.</td></tr>
+<tr><td><code>renders/*.png</code></td><td>About 20 images: 4 corner views, front, side, top, fractured, exploded, cutaways, floor plans, graph, stress.</td></tr>
+</table></div>
+<span class="def"><dfn>glTF</dfn> (.glb): a standard file format for 3D models. Most 3D programs can open it.</span>
+<p>A 5-floor office takes about 1.5 s to make, or about 5 s with all images. Houdini needs 4–6 minutes for each change.</p>
+
+<!-- ============================================================ -->
+<h2 id="bld">4. The .bld file: the contract between the two parts</h2>
+<p>The <code>.bld</code> file is the only link between bgen and rubble. Both sides must agree on its exact layout. This agreement is the <dfn>contract</dfn>.</p>
+<p>The file has a header and a list of <dfn>sections</dfn>. Each section is a list of fixed-size records:</p>
+<div class="tablewrap"><table>
+<tr><th>Section</th><th>One record =</th></tr>
+<tr><td>META</td><td>Text (JSON): name, seed, materials table, rooms, bounds.</td></tr>
+<tr><td>ELEM</td><td>One panel: type (wall, floor…), material, floor number, position.</td></tr>
+<tr><td>CHNK</td><td>One chunk: mass, volume, hit points, center of mass, inertia, flags, and where to find its shapes.</td></tr>
+<tr><td>HVRT / HPLN</td><td>Corner points and face planes of the collision shapes.</td></tr>
+<tr><td>MVRT / MIDX</td><td>Vertices and triangles of the visible meshes.</td></tr>
+<tr><td>EDGE</td><td>One bond: the two chunks, contact area, strength, center, direction.</td></tr>
+<tr><td>ANCH</td><td>Which chunks are anchors (1 bit per chunk).</td></tr>
+<tr><td>SOCK</td><td><dfn>Sockets</dfn>: places to attach extra objects, for example window frames or balcony rails.</td></tr>
+</table></div>
+<p>The header also holds a <dfn>hash</dfn> of all sections. rubble does not load a file if the hash is wrong.</p>
+<span class="def"><dfn>Hash</dfn>: a short number calculated from the file contents. If one byte changes, the hash changes. It shows that the file is not damaged.</span>
+<p>The <dfn>chunk flags</dfn> tell the engine about special chunks: <code>ANCHOR</code> (fixed to the ground), <code>INDESTRUCTIBLE</code> (cannot break), <code>GLASS</code> (breaks on any hit), <code>COSMETIC_ATTACHED</code> (decoration that carries no weight, for example stair steps).</p>
+
+<!-- ============================================================ -->
+<h2 id="rubble">5. Part 2: destroy a building (rubble)</h2>
+<p>rubble is the physics engine. It is written in Rust, a fast programming language. It uses the open-source library <dfn>Rapier</dfn> for the motion of falling pieces. The code for damage, stress and collapse is new.</p>
+<span class="def"><dfn>Rapier</dfn>: a Rust library that simulates <dfn>rigid bodies</dfn>. A rigid body is an object that moves and turns but does not bend.</span>
+
+<h3 id="load">5.1 Load: an intact building costs almost nothing</h3>
+<p>When rubble loads a building, every chunk becomes a <dfn>static</dfn> collider.</p>
+<span class="def"><dfn>Static</dfn>: fixed in place. A static object can be hit, but it does not move, so the engine does not calculate its motion. <dfn>Collider</dfn>: the shape that the engine uses to find contacts.</span>
+<p>Only pieces that break free become moving objects. This is the main reason why the engine is fast: an intact building costs only a few microseconds per step.</p>
+<p>rubble also solves the stress of the intact building fully at load time (see <a href="#stress">5.5</a>). Thus nothing breaks by mistake in the first second.</p>
+
+<h3 id="tick">5.2 One tick, step by step</h3>
+<p>The engine works in <dfn>ticks</dfn>. One tick is 1/60 of a second.</p>
+<span class="def"><dfn>Tick</dfn> (time step): one update of the world. The engine does 60 ticks per second of game time.</span>
+<p>Each tick does these steps in this order:</p>
+<figure>
+<svg viewBox="0 0 900 250" role="img" aria-label="Circular per-tick loop of eleven steps: projectiles, damage, removal, connectivity, stress, promotion, physics step, impacts, settling, budgets, events.">
+  <defs><marker id="ar3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--fig-ink)"/></marker></defs>
+  <g class="svgsmall">
+    <rect class="svgbox" x="10" y="20" width="150" height="56" rx="8"/><text x="85" y="44" text-anchor="middle">1 Projectiles</text><text x="85" y="62" text-anchor="middle">move, test hits</text>
+    <rect class="svgbox" x="185" y="20" width="150" height="56" rx="8"/><text x="260" y="44" text-anchor="middle">2 Damage</text><text x="260" y="62" text-anchor="middle">chunk HP, bond health</text>
+    <rect class="svgbox" x="360" y="20" width="150" height="56" rx="8"/><text x="435" y="44" text-anchor="middle">3 Removal</text><text x="435" y="62" text-anchor="middle">dead chunks, broken bonds</text>
+    <rect class="svgbox" x="535" y="20" width="150" height="56" rx="8"/><text x="610" y="44" text-anchor="middle">4 Connectivity</text><text x="610" y="62" text-anchor="middle">path to the ground?</text>
+    <rect class="svgbox" x="710" y="20" width="180" height="56" rx="8"/><text x="800" y="44" text-anchor="middle">5 Stress</text><text x="800" y="62" text-anchor="middle">too much load? break bonds</text>
+    <rect class="svgbox" x="710" y="170" width="180" height="56" rx="8"/><text x="800" y="194" text-anchor="middle">6 Promotion</text><text x="800" y="212" text-anchor="middle">loose groups → moving bodies</text>
+    <rect class="svgbox" x="535" y="170" width="150" height="56" rx="8"/><text x="610" y="194" text-anchor="middle">7 Physics step</text><text x="610" y="212" text-anchor="middle">Rapier moves bodies</text>
+    <rect class="svgbox" x="360" y="170" width="150" height="56" rx="8"/><text x="435" y="194" text-anchor="middle">8 Impacts</text><text x="435" y="212" text-anchor="middle">hits split bodies</text>
+    <rect class="svgbox" x="185" y="170" width="150" height="56" rx="8"/><text x="260" y="194" text-anchor="middle">9 Settle</text><text x="260" y="212" text-anchor="middle">freeze or remove</text>
+    <rect class="svgbox" x="10" y="170" width="150" height="56" rx="8"/><text x="85" y="194" text-anchor="middle">10 Budgets · 11 Events</text><text x="85" y="212" text-anchor="middle">limits, then report</text>
+  </g>
+  <g class="svgline" marker-end="url(#ar3)">
+    <line x1="160" y1="48" x2="183" y2="48"/><line x1="335" y1="48" x2="358" y2="48"/><line x1="510" y1="48" x2="533" y2="48"/><line x1="685" y1="48" x2="708" y2="48"/>
+    <line x1="800" y1="76" x2="800" y2="168"/>
+    <line x1="710" y1="198" x2="687" y2="198"/><line x1="535" y1="198" x2="512" y2="198"/><line x1="360" y1="198" x2="337" y2="198"/><line x1="185" y1="198" x2="162" y2="198"/>
+    <path d="M85,170 V100 Q85,90 95,90 H585 Q600,90 600,80" stroke-dasharray="4 4"/>
+  </g>
+  <text class="svgsmall" x="340" y="112">a broken bond can make a new loose group → back to step 4</text>
+</svg>
+<figcaption>Figure 12. The 11 steps of one tick. Steps 4 and 5 can repeat: when stress breaks a bond, connectivity runs again.</figcaption>
+</figure>
+
+<h3 id="damage">5.3 Damage: bullets and explosions</h3>
+<p>Each chunk has <dfn>hit points</dfn> (HP). Each bond has a health value.</p>
+<span class="def"><dfn>Hit points</dfn> (HP): a number that goes down when the chunk takes damage. At 0, the chunk is destroyed. Larger chunks have more HP.</span>
+<ul>
+  <li><strong>Bullets.</strong> A bullet is either a <dfn>hitscan</dfn> or a <dfn>ballistic</dfn> projectile. It damages the chunk that it hits, and a little of the neighbor chunks.</li>
+  <li><strong>Explosions.</strong> An explosion damages all chunks in a sphere. Damage is full near the center and goes down to zero at the edge. Chunks behind other chunks get less damage.</li>
+  <li><strong>Cracks.</strong> An explosion also damages bonds out to 1.5 × its radius. Thus it can break whole slabs loose without destroying them. Then the slabs fall in one piece.</li>
+  <li><strong>Glass</strong> breaks on any hit. <strong>Indestructible</strong> chunks ignore damage.</li>
+</ul>
+<span class="def"><dfn>Hitscan</dfn>: the shot hits at once, along a straight line. <dfn>Ballistic</dfn>: the shot is an object that moves through the air for some time, for example a rocket.</span>
+
+<h3 id="connect">5.4 Connectivity: is there still a path to the ground?</h3>
+<p>When a chunk or a bond breaks, the engine marks the nearby chunks as <dfn>dirty</dfn>.</p>
+<span class="def"><dfn>Dirty</dfn>: changed, so the engine must check it again.</span>
+<p>For each dirty chunk, the engine follows the bonds outward. It stops when it finds an anchor. If it does not find an anchor, the chunks that it visited form a loose group. The group will fall.</p>
+<p>This search only visits the part of the building near the damage. Thus it is fast, even in a large building.</p>
+
+<h3 id="stress">5.5 Stress: can the remaining structure carry the weight?</h3>
+<p>Connectivity is not sufficient. A building can still connect to the ground through one thin column. Real buildings fall when their supports are too weak. The <dfn>stress solver</dfn> handles this.</p>
+<span class="def"><dfn>Stress solver</dfn>: code that calculates how much load each bond carries. <dfn>Load</dfn>: the force that a part must carry, mostly the weight of everything above it.</span>
+<p>The solver treats the building like an electrical circuit:</p>
+<figure>
+<svg viewBox="0 0 900 260" role="img" aria-label="Analogy: each chunk is a current source equal to its weight, each bond is a resistor, anchors are ground. Current flowing through a resistor equals the load on that bond.">
+  <text class="svgtext" x="20" y="24" font-weight="700">Weight flows down like electric current</text>
+  <g>
+    <circle cx="200" cy="70" r="18" fill="var(--fig-b)" stroke="var(--fig-ink)"/><text class="svgsmall" x="200" y="74" text-anchor="middle">w</text>
+    <circle cx="320" cy="70" r="18" fill="var(--fig-b)" stroke="var(--fig-ink)"/><text class="svgsmall" x="320" y="74" text-anchor="middle">w</text>
+    <circle cx="140" cy="150" r="18" fill="var(--fig-b)" stroke="var(--fig-ink)"/><text class="svgsmall" x="140" y="154" text-anchor="middle">w</text>
+    <circle cx="260" cy="150" r="18" fill="var(--fig-b)" stroke="var(--fig-ink)"/><text class="svgsmall" x="260" y="154" text-anchor="middle">w</text>
+    <circle cx="380" cy="150" r="18" fill="var(--fig-b)" stroke="var(--fig-ink)"/><text class="svgsmall" x="380" y="154" text-anchor="middle">w</text>
+    <g stroke="var(--fig-ink)" stroke-width="2">
+      <line x1="218" y1="70" x2="302" y2="70"/><line x1="190" y1="86" x2="150" y2="134"/><line x1="210" y1="86" x2="250" y2="134"/>
+      <line x1="315" y1="88" x2="270" y2="134"/><line x1="330" y1="88" x2="372" y2="134"/>
+      <line x1="158" y1="150" x2="242" y2="150"/><line x1="278" y1="150" x2="362" y2="150"/>
+      <line x1="140" y1="168" x2="140" y2="212" stroke-width="5" stroke="var(--warn)"/>
+      <line x1="380" y1="168" x2="380" y2="212" stroke-width="5" stroke="var(--warn)"/>
+    </g>
+    <rect x="100" y="212" width="320" height="10" fill="var(--fig-ink)"/>
+    <text class="svgsmall" x="260" y="245" text-anchor="middle">ground (anchors)</text>
+    <text class="svgsmall" x="430" y="196" fill="var(--warn)">thick = high load</text>
+  </g>
+  <g class="svgsmall">
+    <text x="500" y="70">● chunk = a source of current; current = its weight (w)</text>
+    <text x="500" y="100">— bond = a wire; a stronger bond conducts more</text>
+    <text x="500" y="130">▬ anchors = ground; all current ends there</text>
+    <text x="500" y="160">current in a wire = load on that bond</text>
+    <text x="500" y="190">utilization = load ÷ bond strength</text>
+    <text x="500" y="220">above 1.0 for 0.25 s → the bond breaks</text>
+  </g>
+</svg>
+<figcaption>Figure 13. The circuit analogy. If you remove the left column, all the current must go through the right column. Its load doubles.</figcaption>
+</figure>
+<p>The solver works in these steps:</p>
+<ol class="steps">
+  <li>Give each chunk a load equal to its weight (mass × 9.81).</li>
+  <li>Solve the circuit equations. The solver uses <dfn>conjugate gradient</dfn>. It starts from the answer of the last tick (a <dfn>warm start</dfn>), so it needs few steps.</li>
+  <li>Calculate the load in each bond from the result.</li>
+  <li>Add a <dfn>bending</dfn> load for parts that stick out, for example balconies.</li>
+  <li>Calculate the utilization of each bond.</li>
+  <li>If a bond stays above 1.0 for 0.25 s, break it. Break at most 8 bonds per tick, the worst first. Thus a collapse spreads over several frames and looks natural.</li>
+</ol>
+<span class="def"><dfn>Conjugate gradient</dfn>: a standard method that solves a very large set of linked equations in small repeated steps. <dfn>Warm start</dfn>: begin from a previous answer instead of from zero. <dfn>Bending</dfn>: a part that sticks out, like a shelf, tries to turn at its support. The joint at the support carries extra load.</span>
+<p>Three rules make the model more realistic:</p>
+<ul>
+  <li><strong>Compression is stronger than pull.</strong> A bond that carries weight straight down is 10 times stronger. Real concrete is much stronger in <dfn>compression</dfn> (squeeze) than in <dfn>tension</dfn> (pull).</li>
+  <li><strong>Bending uses whole sections.</strong> The solver adds up the bending of all bonds along one cut line (for example, where a wall meets a column). One small contact does not count as a full beam.</li>
+  <li><strong>Break only on a good answer.</strong> The engine breaks bonds only after the solver <dfn>converges</dfn>, or after 20 ticks. This stops false breaks from an unfinished calculation.</li>
+</ul>
+<span class="def"><dfn>Converge</dfn>: the repeated steps of the solver come close enough to the exact answer.</span>
+<p>bgen uses the same solver offline in its stability check. Thus the generator and the engine agree about which buildings stand.</p>
+
+<h3 id="fall">5.6 Fall and break up</h3>
+<p>A loose group of chunks is a <dfn>cluster</dfn>.</p>
+<span class="def"><dfn>Cluster</dfn>: a group of connected chunks that moves as one rigid body. One falling 5-storey section is one cluster, not 2,000 separate pieces. This keeps the engine fast.</span>
+<ol class="steps">
+  <li><strong>Warning.</strong> The engine sends a <code>CollapseWarning</code> event. The group waits 0.3–1.0 s (longer for heavier groups). A game can show dust and play a creak sound in this time.</li>
+  <li><strong>Promotion.</strong> The static colliders of the group go away. One moving body takes their place. Its mass and inertia are the sum of the chunk values from the .bld file.</li>
+  <li><strong>Fall.</strong> Rapier moves the body with gravity. If an explosion caused the break, the body starts with the push of the explosion.</li>
+  <li><strong>Impact.</strong> When the body hits something hard, the engine runs the stress solver on the body itself. The sudden stop acts like extra weight. Bonds that are too weak break.</li>
+  <li><strong>Split.</strong> The body divides along the broken bonds. Each new part becomes its own body and keeps its speed.</li>
+</ol>
+<p>Small destroyed chunks become small flying <dfn>debris</dfn> or disappear as particles. Larger destroyed chunks always disappear as particles.</p>
+<span class="def"><dfn>Debris</dfn>: small broken pieces that fly and fall.</span>
+
+<h3 id="settle">5.7 Settle and freeze: rubble changes the map</h3>
+<p>In THE FINALS, rubble stays where it lands. rubble does the same.</p>
+<ul>
+  <li>A body that stays still for 0.5 s (and is at least 2 s old) <dfn>freezes</dfn>.</li>
+  <li>Its chunks become static colliders again, at their new position. You can still shoot them.</li>
+  <li>Small debris disappears after some seconds.</li>
+  <li>A body does not freeze while the thing under it still moves.</li>
+  <li>If the support under frozen rubble goes away (destroyed, broken loose or removed), the rubble <dfn>thaws</dfn>: it becomes a moving body again, falls, and freezes again where it lands.</li>
+</ul>
+<span class="def"><dfn>Thaw</dfn>: turn frozen pieces back into a moving body. The engine tests support by moving the pieces down 3 cm: if they touch something that they do not touch when moved up 3 cm, something holds them up.</span>
+<span class="def"><dfn>Freeze</dfn>: turn a moving body back into fixed (static) pieces. This removes its cost from the physics step.</span>
+<p>The engine also has <dfn>budgets</dfn>: for example, at most 512 moving clusters. If there are too many, the smallest or oldest pieces freeze early or disappear.</p>
+<span class="def"><dfn>Budget</dfn>: a fixed limit on work or objects. It keeps every tick fast.</span>
+<figure>
+<svg viewBox="0 0 900 150" role="img" aria-label="Chunk life cycle: static, detaching, in a moving cluster, then either frozen as rubble or gone.">
+  <defs><marker id="ar4" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--fig-ink)"/></marker></defs>
+  <g class="svgsmall">
+    <rect x="10" y="45" width="140" height="56" rx="28" fill="var(--fig-a)" stroke="var(--fig-ink)"/><text x="80" y="69" text-anchor="middle" font-weight="700">Static</text><text x="80" y="86" text-anchor="middle">part of building</text>
+    <rect x="215" y="45" width="140" height="56" rx="28" fill="var(--fig-b)" stroke="var(--fig-ink)"/><text x="285" y="69" text-anchor="middle" font-weight="700">Detaching</text><text x="285" y="86" text-anchor="middle">0.3–1.0 s warning</text>
+    <rect x="420" y="45" width="150" height="56" rx="28" fill="var(--fig-d)" stroke="var(--fig-ink)"/><text x="495" y="69" text-anchor="middle" font-weight="700">In cluster</text><text x="495" y="86" text-anchor="middle">falls, hits, splits</text>
+    <rect x="650" y="10" width="140" height="50" rx="25" fill="var(--fig-c)" stroke="var(--fig-ink)"/><text x="720" y="32" text-anchor="middle" font-weight="700">Frozen</text><text x="720" y="48" text-anchor="middle">static rubble</text>
+    <rect x="650" y="90" width="140" height="50" rx="25" class="svgbox"/><text x="720" y="112" text-anchor="middle" font-weight="700">Gone</text><text x="720" y="128" text-anchor="middle">destroyed / removed</text>
+  </g>
+  <g class="svgline" marker-end="url(#ar4)">
+    <line x1="150" y1="73" x2="213" y2="73"/><line x1="355" y1="73" x2="418" y2="73"/>
+    <line x1="570" y1="62" x2="648" y2="38"/><line x1="570" y1="85" x2="648" y2="112"/>
+  </g>
+  <text class="svgsmall" x="182" y="125">no path to ground, or too much stress</text>
+</svg>
+<figcaption>Figure 14. The states of one chunk. A static chunk can also go directly to "Gone" when its HP reaches 0. A frozen chunk can take damage again.</figcaption>
+</figure>
+
+<!-- ============================================================ -->
+<h2 id="see">6. See the results</h2>
+<h3 id="gifs">6.1 Collapse animations</h3>
+<p>These animations come directly from the engine. The scenario runner plays a scenario, saves the chunk positions of every 4th tick, and the bgen renderer draws each frame. Nothing is animated by hand.</p>
+<p>In each collapse, a grid of charges goes off at 0.5 s, 1.2 m above the ground. The charges destroy the ground floor. Then the steps of section 5 take over: connectivity, stress, warning, fall, impact and freeze.</p>
+<div class="grid2">
+  <figure>
+    <picture>
+      <source srcset="explainer/img/sheet_office_columns_out.jpg" media="(prefers-reduced-motion: reduce)">
+      <img src="explainer/img/gif_office_collapse.gif" alt="Animation: a five-storey office loses its ground floor; the floors above drop, tilt and break into a rubble pile." loading="lazy">
+    </picture>
+    <figcaption>Office, 5 floors, 5,398 chunks. 35 charges. The upper floors drop, break on impact and settle into a pile.</figcaption>
+  </figure>
+  <figure>
+    <picture>
+      <source srcset="explainer/img/sheet_tower_columns_out.jpg" media="(prefers-reduced-motion: reduce)">
+      <img src="explainer/img/gif_tower_collapse.gif" alt="Animation: a ten-storey tower drops onto its destroyed ground floor and breaks up floor by floor into a low pile." loading="lazy">
+    </picture>
+    <figcaption>Tower, 10 floors, 5,288 chunks. 36 charges. The tower falls straight down and breaks up floor by floor.</figcaption>
+  </figure>
+  <figure>
+    <picture>
+      <source srcset="explainer/img/sheet_apartment_ground_out.jpg" media="(prefers-reduced-motion: reduce)">
+      <img src="explainer/img/gif_apartment_collapse.gif" alt="Animation: a five-storey apartment block collapses into rubble after its ground floor is destroyed." loading="lazy">
+    </picture>
+    <figcaption>Apartment block, 5 floors, 4,713 chunks. 60 charges on a 2.2 m grid. With wider spacing, wall pieces between the charges survive and hold the block up.</figcaption>
+  </figure>
+  <figure>
+    <picture>
+      <source srcset="explainer/img/sheet_office_top_blast.jpg" media="(prefers-reduced-motion: reduce)">
+      <img src="explainer/img/gif_office_top_blast.gif" alt="Animation: an explosion on the top floor of the office, seen with the roof hidden; inside walls break but the building stands." loading="lazy">
+    </picture>
+    <figcaption>Control test: one explosion on the top floor (roof hidden). Inside walls break, but the building correctly stays up.</figcaption>
+  </figure>
+</div>
+<div class="note">If your system asks for reduced motion, this page shows still contact sheets in place of the animations.</div>
+
+<h3>6.2 Scripted scenarios</h3>
+<p>A <dfn>scenario</dfn> is a YAML file that lists buildings and timed actions, for example "at 0.5 s, explode at this point". The scenario runner plays it, saves every frame and makes a GIF and a contact sheet.</p>
+<span class="def"><dfn>Scenario</dfn>: a repeatable test of destruction. <dfn>Contact sheet</dfn>: one image with several key frames side by side.</span>
+<figure>
+  <img src="explainer/img/sheet_two_box_drop.jpg" alt="Two stacked pairs of cubes; the bottom pair is destroyed and the top pair drops one meter and stops.">
+  <figcaption>Figure 15. The smallest test: two boxes on two boxes. The engine destroys the bottom boxes. After the warning delay, the top boxes fall 1 m as one cluster, then freeze.</figcaption>
+</figure>
+
+<h3>6.3 The interactive viewer</h3>
+<p>The viewer is a desktop program. It uses <dfn>Bevy</dfn>, a Rust game engine, to draw the world. You can fly the camera, shoot, set off explosions and show the stress of every bond as color.</p>
+<figure>
+  <img src="explainer/img/viewer.jpg" alt="Viewer window showing a brick apartment building with balconies, with a help panel at the top left">
+  <figcaption>Figure 16. The viewer. Push <kbd>+</kbd> or <kbd>-</kbd> to go to the next or previous building in <code>assets/buildings</code>.</figcaption>
+</figure>
+<div class="tablewrap"><table>
+<tr><th>Key</th><th>Action</th></tr>
+<tr><td>Left mouse button</td><td>Fire the weapon</td></tr>
+<tr><td>1 / 2 / 3</td><td>Select assault rifle / sniper / rocket launcher</td></tr>
+<tr><td>E, [ and ]</td><td>Explosion at the cursor; make the radius smaller or larger</td></tr>
+<tr><td>G</td><td>Large explosion</td></tr>
+<tr><td>+ / -</td><td>Next / previous building (wraps around)</td></tr>
+<tr><td>Right mouse + W A S D</td><td>Fly the camera (O: orbit mode)</td></tr>
+<tr><td>R, P, .</td><td>Reset, pause, one step</td></tr>
+<tr><td>F1 … F5, H</td><td>Stress graph, anchors, chunk colors, cluster colors, statistics, help</td></tr>
+</table></div>
+
+<!-- ============================================================ -->
+<h2 id="perf">7. Performance</h2>
+<p>All numbers come from an Apple M3 Max. One tick must take less than 16.7 ms for 60 ticks per second.</p>
+<div class="tablewrap"><table>
+<tr><th>Measurement</th><th>Result</th></tr>
+<tr><td>Make a 5-floor office (bgen)</td><td>≈ 1.5 s, or ≈ 5 s with all images</td></tr>
+<tr><td>Make all 18 test buildings (6 presets × 3 seeds)</td><td>12.5 s</td></tr>
+<tr><td>Load a 5,000-chunk building (rubble)</td><td>≈ 20 ms</td></tr>
+<tr><td>Tick with no destruction (91,000 chunks)</td><td>≈ 0.1 ms</td></tr>
+<tr><td>Office collapse: average tick / worst tick</td><td>≈ 2.6 ms / ≈ 7 ms</td></tr>
+<tr><td>Stress update after damage (100,000 chunks)</td><td>≈ 1–1.6 ms</td></tr>
+</table></div>
+
+<!-- ============================================================ -->
+<h2 id="limits">8. Known limits</h2>
+<div class="caution"><strong>Caution:</strong> the stress model is a simplification for a game. It is not an engineering tool. Do not use it to judge real buildings.</div>
+<ul>
+  <li><strong>No hinges and no sag.</strong> A bond is either fully rigid or broken. A slab cannot hang from one edge or bend down slowly.</li>
+  <li><strong>Few pillars can hold too much.</strong> After very large damage, the stress answer takes several seconds to catch up. Columns are also strong in compression, and nothing can tip over. Thus a building can stand on a few pillars for too long.</li>
+  <li><strong>Very tall falling sections stay in one piece.</strong> In building4, the upper tower drops one floor and stays upright. The landing break-up only reacts to hard impacts.</li>
+  <li><strong>Fast debris can pass through thin slabs</strong> (above about 18 m/s), because continuous collision detection is off for speed.</li>
+  <li><strong>The generator</strong> supports only rectangular room layouts and simple pitched roofs. Reinforcement makes bonds stronger, but it does not add visible beams.</li>
+  <li><strong>Not made:</strong> whole-district generation, door swings on plans, transparent glass, dust and sound effects.</li>
+</ul>
+
+  <figure>
+    <picture>
+      <source srcset="explainer/img/sheet_building4_shaft_cut.jpg" media="(prefers-reduced-motion: reduce)">
+      <img src="explainer/img/gif_building4_limit.gif" alt="Animation: the 52-storey building4 after its fifth floor is destroyed; loose pieces fall, but the 47 floors above drop slightly and stay upright." loading="lazy">
+    </picture>
+    <figcaption>Known limit: building4 (52 floors) after charges destroy floor 5. The 47 floors above drop about 3.6 m as one rigid piece and stay upright. A real tower would crush itself floor by floor.</figcaption>
+  </figure>
+
+<!-- ============================================================ -->
+<h2 id="run">9. How to run it</h2>
+<p>Do these steps from the project folder <code>the-finals/</code>.</p>
+<ol class="steps">
+  <li>Make one building:<pre>.venv/bin/bgen build bgen/specs/office.yaml --seed 1 --out assets/buildings</pre></li>
+  <li>Look at the images in <code>assets/buildings/office_1/renders/</code>.</li>
+  <li>Play a destruction scenario and make a GIF:<pre>.venv/bin/python -m bgen.sim scenarios/office_columns_out.yaml</pre></li>
+  <li>Open the result in <code>runs/office_columns_out/</code>.</li>
+  <li>Start the viewer:<pre>cd rubble &amp;&amp; cargo run --release -p rubble-viewer -- ../assets/buildings/office_1/building.bld</pre></li>
+</ol>
+<p>See <code>README.md</code> for set-up, tests and more commands. See <code>DESIGN.md</code> for the full design.</p>
+
+<!-- ============================================================ -->
+<h2 id="glossary">10. Glossary</h2>
+<dl class="glossary">
+  <dt>Anchor</dt><dd>A chunk fixed to the ground. All weight flows to anchors.</dd>
+  <dt>Blockout</dt><dd>The rough shape of a building: footprints and floor counts.</dd>
+  <dt>Bond, edge, joint</dt><dd>A contact between two chunks, with an area and a strength.</dd>
+  <dt>Budget</dt><dd>A fixed limit on work or objects per tick.</dd>
+  <dt>Chunk</dt><dd>One pre-cut convex piece of a panel. The smallest part that can break off.</dd>
+  <dt>Cluster</dt><dd>A group of connected chunks that moves as one rigid body.</dd>
+  <dt>Collider</dt><dd>The shape that the physics engine uses to find contacts.</dd>
+  <dt>Connection graph</dt><dd>All chunks (nodes) and all bonds (edges) of a building.</dd>
+  <dt>Convex</dt><dd>A shape with no dents. Any straight line between two inside points stays inside.</dd>
+  <dt>Feature node</dt><dd>A function that adds one type of part (walls, rooms, roofs…).</dd>
+  <dt>Freeze</dt><dd>Turn a still, moving body back into static pieces.</dd>
+  <dt>Hit points (HP)</dt><dd>Damage that a chunk can take before it is destroyed.</dd>
+  <dt>Panel</dt><dd>A 2D profile plus a thickness. Every structural part is a panel.</dd>
+  <dt>Pre-fracture</dt><dd>Cut objects into pieces before play, not during play.</dd>
+  <dt>Seed</dt><dd>A number that fixes all random choices. Same seed, same building.</dd>
+  <dt>Spec</dt><dd>The YAML file that describes a building.</dd>
+  <dt>Static</dt><dd>Fixed in place; the engine does not calculate its motion.</dd>
+  <dt>Stress solver</dt><dd>Code that calculates the load on every bond.</dd>
+  <dt>Tick</dt><dd>One 1/60 s update of the world.</dd>
+  <dt>Utilization</dt><dd>Load ÷ strength of a bond. 1.0 or more means it breaks.</dd>
+  <dt>Voronoi cell</dt><dd>The area nearest to one seed point. Used to cut panels into chunks.</dd>
+</dl>
+</main>
+</div>
+<script>
+(function () {
+  var root = document.documentElement, btn = document.getElementById('themeToggle'), key = 'explainer-theme';
+  try { var t = localStorage.getItem(key); if (t) root.setAttribute('data-theme', t); } catch (e) {}
+  btn.addEventListener('click', function () {
+    var dark = root.getAttribute('data-theme') ? root.getAttribute('data-theme') === 'dark'
+      : window.matchMedia('(prefers-color-scheme: dark)').matches;
+    var next = dark ? 'light' : 'dark';
+    root.setAttribute('data-theme', next);
+    try { localStorage.setItem(key, next); } catch (e) {}
+  });
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,16 @@
+[package]
+name = "rubble-sim"
+edition.workspace = true
+version.workspace = true
+
+[[bin]]
+name = "rubble-sim"
+path = "src/main.rs"
+
+[dependencies]
+rubble-core = { path = "../rubble-core" }
+rubble-format = { path = "../rubble-format" }
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+rayon.workspace = true

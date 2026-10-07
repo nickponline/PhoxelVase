@@ -1,0 +1,5 @@
+# Single-storey warehouse, tall ribbon windows, wide entrance, flat or low gable metal roof.
+name: warehouse
+preset: warehouse
+seed: 3
+blockout: {shape: rect, width: [30, 44], depth: [20, 26], floors: 1, roof: [flat, gable]}

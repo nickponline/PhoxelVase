@@ -1,0 +1,7 @@
+# Golden fixture: destroy the two anchored bottom boxes; the top slab falls and freezes.
+buildings:
+  - {path: ../../../../fixtures/two_box.bld, pos: [0, 0, 0], yaw: 0}
+steps: 240
+actions:
+  - {t: 0.1, damage: {building: 0, chunks: [0, 1]}}
+record: {out: runs/two_box/}

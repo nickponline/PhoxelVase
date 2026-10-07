@@ -1,0 +1,23 @@
+[package]
+name = "rubble-py"
+edition.workspace = true
+version.workspace = true
+description = "Python bindings for rubble (DESIGN.md §3.6)"
+
+[lib]
+name = "rubble"
+crate-type = ["cdylib"]
+# the cdylib links against libpython only at import time; no Rust test harness
+test = false
+doctest = false
+
+[dependencies]
+rubble-core = { path = "../rubble-core", default-features = false }
+rubble-format = { path = "../rubble-format" }
+rubble-stress = { path = "../rubble-stress" }
+pyo3 = { version = "0.25", features = ["extension-module", "abi3-py311"] }
+numpy = "0.25"
+serde_json.workspace = true
+
+[build-dependencies]
+pyo3-build-config = "0.25"

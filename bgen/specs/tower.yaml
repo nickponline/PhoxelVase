@@ -1,0 +1,5 @@
+# 8-15 storey tower, optionally on a podium; ribbon glazing, coarse concrete cells.
+name: tower
+preset: tower
+seed: 11
+blockout: {shape: [rect, podium], width: [20, 30], depth: [18, 24], floors: [8, 15]}

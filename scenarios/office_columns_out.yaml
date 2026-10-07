@@ -1,0 +1,48 @@
+# Blow out the ground-floor supports of the generated office (5 floors, 24x15 m): a grid of
+# 35 charges at z=1.2 m (radius 2.4 m, below the floor-1 slab at z=3.49) destroys the ground-floor
+# columns and walls; the four floors above must come down.
+#   .venv/bin/python -m bgen.sim scenarios/office_columns_out.yaml
+buildings:
+  - {path: assets/buildings/office_1/building.bld, pos: [0, 0, 0], yaw: 0}
+steps: 480
+dt: 0.016666
+ground: 0.0
+actions:
+  - {t: 0.5, explode: {center: [1.5, 1.2, 1.2], radius: 2.4, inner_radius: 1.2, damage: 10000, impulse: 2000}}
+  - {t: 0.5, explode: {center: [5, 1.2, 1.2], radius: 2.4, inner_radius: 1.2, damage: 10000, impulse: 2000}}
+  - {t: 0.5, explode: {center: [8.5, 1.2, 1.2], radius: 2.4, inner_radius: 1.2, damage: 10000, impulse: 2000}}
+  - {t: 0.5, explode: {center: [12, 1.2, 1.2], radius: 2.4, inner_radius: 1.2, damage: 10000, impulse: 2000}}
+  - {t: 0.5, explode: {center: [15.5, 1.2, 1.2], radius: 2.4, inner_radius: 1.2, damage: 10000, impulse: 2000}}
+  - {t: 0.5, explode: {center: [19, 1.2, 1.2], radius: 2.4, inner_radius: 1.2, damage: 10000, impulse: 2000}}
+  - {t: 0.5, explode: {center: [22.5, 1.2, 1.2], radius: 2.4, inner_radius: 1.2, damage: 10000, impulse: 2000}}
+  - {t: 0.5, explode: {center: [1.5, 4.6, 1.2], radius: 2.4, inner_radius: 1.2, damage: 10000, impulse: 2000}}
+  - {t: 0.5, explode: {center: [5, 4.6, 1.2], radius: 2.4, inner_radius: 1.2, damage: 10000, impulse: 2000}}
+  - {t: 0.5, explode: {center: [8.5, 4.6, 1.2], radius: 2.4, inner_radius: 1.2, damage: 10000, impulse: 2000}}
+  - {t: 0.5, explode: {center: [12, 4.6, 1.2], radius: 2.4, inner_radius: 1.2, damage: 10000, impulse: 2000}}
+  - {t: 0.5, explode: {center: [15.5, 4.6, 1.2], radius: 2.4, inner_radius: 1.2, damage: 10000, impulse: 2000}}
+  - {t: 0.5, explode: {center: [19, 4.6, 1.2], radius: 2.4, inner_radius: 1.2, damage: 10000, impulse: 2000}}
+  - {t: 0.5, explode: {center: [22.5, 4.6, 1.2], radius: 2.4, inner_radius: 1.2, damage: 10000, impulse: 2000}}
+  - {t: 0.5, explode: {center: [1.5, 8.0, 1.2], radius: 2.4, inner_radius: 1.2, damage: 10000, impulse: 2000}}
+  - {t: 0.5, explode: {center: [5, 8.0, 1.2], radius: 2.4, inner_radius: 1.2, damage: 10000, impulse: 2000}}
+  - {t: 0.5, explode: {center: [8.5, 8.0, 1.2], radius: 2.4, inner_radius: 1.2, damage: 10000, impulse: 2000}}
+  - {t: 0.5, explode: {center: [12, 8.0, 1.2], radius: 2.4, inner_radius: 1.2, damage: 10000, impulse: 2000}}
+  - {t: 0.5, explode: {center: [15.5, 8.0, 1.2], radius: 2.4, inner_radius: 1.2, damage: 10000, impulse: 2000}}
+  - {t: 0.5, explode: {center: [19, 8.0, 1.2], radius: 2.4, inner_radius: 1.2, damage: 10000, impulse: 2000}}
+  - {t: 0.5, explode: {center: [22.5, 8.0, 1.2], radius: 2.4, inner_radius: 1.2, damage: 10000, impulse: 2000}}
+  - {t: 0.5, explode: {center: [1.5, 11.4, 1.2], radius: 2.4, inner_radius: 1.2, damage: 10000, impulse: 2000}}
+  - {t: 0.5, explode: {center: [5, 11.4, 1.2], radius: 2.4, inner_radius: 1.2, damage: 10000, impulse: 2000}}
+  - {t: 0.5, explode: {center: [8.5, 11.4, 1.2], radius: 2.4, inner_radius: 1.2, damage: 10000, impulse: 2000}}
+  - {t: 0.5, explode: {center: [12, 11.4, 1.2], radius: 2.4, inner_radius: 1.2, damage: 10000, impulse: 2000}}
+  - {t: 0.5, explode: {center: [15.5, 11.4, 1.2], radius: 2.4, inner_radius: 1.2, damage: 10000, impulse: 2000}}
+  - {t: 0.5, explode: {center: [19, 11.4, 1.2], radius: 2.4, inner_radius: 1.2, damage: 10000, impulse: 2000}}
+  - {t: 0.5, explode: {center: [22.5, 11.4, 1.2], radius: 2.4, inner_radius: 1.2, damage: 10000, impulse: 2000}}
+  - {t: 0.5, explode: {center: [1.5, 14.2, 1.2], radius: 2.4, inner_radius: 1.2, damage: 10000, impulse: 2000}}
+  - {t: 0.5, explode: {center: [5, 14.2, 1.2], radius: 2.4, inner_radius: 1.2, damage: 10000, impulse: 2000}}
+  - {t: 0.5, explode: {center: [8.5, 14.2, 1.2], radius: 2.4, inner_radius: 1.2, damage: 10000, impulse: 2000}}
+  - {t: 0.5, explode: {center: [12, 14.2, 1.2], radius: 2.4, inner_radius: 1.2, damage: 10000, impulse: 2000}}
+  - {t: 0.5, explode: {center: [15.5, 14.2, 1.2], radius: 2.4, inner_radius: 1.2, damage: 10000, impulse: 2000}}
+  - {t: 0.5, explode: {center: [19, 14.2, 1.2], radius: 2.4, inner_radius: 1.2, damage: 10000, impulse: 2000}}
+  - {t: 0.5, explode: {center: [22.5, 14.2, 1.2], radius: 2.4, inner_radius: 1.2, damage: 10000, impulse: 2000}}
+record: {out: runs/office_columns_out/, every: 4}
+render: {camera: iso_ne, size: [960, 720]}
+expect: {collapse: true}

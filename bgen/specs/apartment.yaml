@@ -1,0 +1,14 @@
+# Apartment block with corridor, punched/arched windows and south balconies.
+name: apartment
+preset: apartment
+seed: 7
+blockout: {shape: [rect, L], width: [22, 32], depth: [12, 15], floors: [4, 6]}
+nodes:
+  - floors: {}
+  - exterior_walls: {bay_width: [3.0, 4.0]}
+  - columns: {grid: 7.0, size: 0.4}
+  - rooms: {min_room: 8.0, corridor: true, tags: {living_room: 0.35, bedroom: 0.4, kitchen: 0.15, bathroom: 0.1}}
+  - stairs: {cores: 1}
+  - openings: {windows: {style: [punched, arched], sill: 0.9, head: 2.3, width: [1.0, 1.6]}}
+  - roofs: {flat: {parapet: 1.1}}
+  - balconies: {facades: [south], every_n_floors: 1, depth: [1.2, 1.5], probability: 0.6}

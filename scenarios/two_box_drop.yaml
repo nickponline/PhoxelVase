@@ -1,0 +1,12 @@
+# Golden fixture: destroy the two anchored bottom boxes -> the top pair detaches, falls 1 m and settles.
+#   .venv/bin/python -m bgen.sim scenarios/two_box_drop.yaml
+buildings:
+  - {path: ../fixtures/two_box.bld, pos: [0, 0, 0], yaw: 0}
+steps: 150
+dt: 0.016666
+ground: 0.0
+actions:
+  - {t: 0.2, damage: {building: 0, chunks: [0, 1], amount: 1.0e9}}
+record: {out: runs/two_box_drop/, every: 2}
+render: {camera: iso_ne, size: [640, 480]}
+expect: {collapse: true}

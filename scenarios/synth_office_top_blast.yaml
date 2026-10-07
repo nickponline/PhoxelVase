@@ -1,0 +1,13 @@
+# Synthetic 3-floor office (see synth_office_columns_out.yaml): one explosion (r 2.5 m; synthetic chunks only have 100 hp) in the
+# top floor (z 6.25-9) punches a hole but the building must stay up.
+#   .venv/bin/python -m bgen.sim scenarios/synth_office_top_blast.yaml
+buildings:
+  - {path: ../fixtures/synth_office_3f.bld, pos: [0, 0, 0], yaw: 0}
+steps: 300
+dt: 0.016666
+ground: 0.0
+actions:
+  - {t: 0.5, explode: {center: [6.0, 4.0, 7.5], radius: 2.5, inner_radius: 0.5, damage: 200, impulse: 2000}}
+record: {out: runs/synth_office_top_blast/, every: 3}
+render: {camera: iso_ne, size: [960, 720], cutaway_z: 9.0}   # roof hidden
+expect: {collapse: false}

@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pyc
+rubble/target/
+assets/buildings/*
+!assets/buildings/.keep
+runs/
+*.so
+.DS_Store
+*.egg-info/

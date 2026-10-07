@@ -1,0 +1,12 @@
+# Wooden machiya-like house with a curved (sori) roof polygonised into strips.
+name: kyoto
+preset: kyoto
+seed: 8
+blockout: {shape: rect, width: [11, 14], depth: [8, 10], floors: [1, 2], roof: kyoto}
+nodes:
+  - floors: {}
+  - exterior_walls: {bay_width: [1.8, 2.4]}
+  - rooms: {min_room: 7.0, tags: {washitsu: 0.6, engawa: 0.2, kitchen: 0.2}}
+  - stairs: {flight_width: 1.0}
+  - openings: {windows: {style: [punched, round], sill: 0.8, head: 2.0, width: [0.9, 1.4]}}
+  - roofs: {kyoto: {pitch_deg: [36, 42], eaves: 0.9, strips: 4}}

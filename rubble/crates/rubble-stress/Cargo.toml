@@ -1,0 +1,15 @@
+[package]
+name = "rubble-stress"
+edition.workspace = true
+version.workspace = true
+description = "Structural stress solver for rubble: resistive-network load flow (PCG) + bending estimate + hysteresis breaking"
+
+[dependencies]
+rayon.workspace = true
+
+[dev-dependencies]
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+
+[[bench]]
+name = "solve"
+harness = false

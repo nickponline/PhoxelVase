@@ -1,0 +1,21 @@
+[package]
+name = "rubble-core"
+edition.workspace = true
+version.workspace = true
+
+[features]
+default = ["testutil"]
+testutil = []
+enhanced-determinism = ["rapier3d/enhanced-determinism", "parry3d/enhanced-determinism"]
+
+[dependencies]
+rubble-format = { path = "../rubble-format" }
+rubble-stress = { path = "../rubble-stress" }
+rapier3d.workspace = true
+parry3d.workspace = true
+rayon.workspace = true
+slotmap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+blake3.workspace = true
