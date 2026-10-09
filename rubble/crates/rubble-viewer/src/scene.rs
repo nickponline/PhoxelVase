@@ -28,6 +28,8 @@ pub struct Args {
     pub record_every: u32,
     /// screenshot/record mode: press X (demolish every building) at this frame
     pub demolish_frame: Option<u32>,
+    /// screenshot/record mode: press Z (interior demolition of every building) at this frame
+    pub interior_frame: Option<u32>,
     /// screenshot/record mode: render this many seconds before the simulation starts (shader
     /// pipelines compile asynchronously; frames captured before that are black)
     pub warmup: f32,
@@ -43,6 +45,7 @@ pub const USAGE: &str = "usage: rubble-viewer [FILE.bld ...] [--scenario S.yaml]
         [--beam x,y,z,dx,dy,dz] [--cam x,y,z] [--look x,y,z] [--overlay f1,..,f8|lighting|particles|nolighting|noparticles] [--size WxH]]
        [--record DIR --frames N [--record-every K]]   frames DIR/frame_00000.png ... every K ticks (default 4)
        [--demolish-frame K]   screenshot/record mode: demolish (X) every building at tick K
+       [--interior-frame K]   screenshot/record mode: interior demolition (Z) of every building at tick K
        [--warmup SECS]   render before simulating (default 3 s when recording)
   no inputs: synthetic testutil arena.  --arena N: N synthetic 6-storey towers (perf test).
   coordinates are engine Z-up meters.";
@@ -62,6 +65,7 @@ impl Args {
                 "--record-every" => a.record_every = val()?.parse::<u32>().map_err(|e| format!("--record-every: {e}"))?.max(1),
                 "--warmup" => a.warmup = val()?.parse().map_err(|e| format!("--warmup: {e}"))?,
                 "--demolish-frame" => a.demolish_frame = Some(val()?.parse().map_err(|e| format!("--demolish-frame: {e}"))?),
+                "--interior-frame" => a.interior_frame = Some(val()?.parse().map_err(|e| format!("--interior-frame: {e}"))?),
                 "--frames" => a.frames = val()?.parse().map_err(|e| format!("--frames: {e}"))?,
                 "--explode" => {
                     let v = val()?;

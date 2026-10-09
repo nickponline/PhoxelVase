@@ -1,12 +1,9 @@
 """Parametric generators for the `sculpt` node: params (ranges already sampled) -> primitives.
 
-    eiffel             wrought-iron lattice tower: 4 truss legs merging into a tapering shaft
-    suspension_bridge  two-tower suspension bridge: deck, portal towers, parabolic cables, hangers
     aqueduct           three-tier stone arch viaduct (Pont du Gard-like)
     colossus           robed figure with a raised torch on a stepped pedestal
 
-All coordinates are metres, z up, ground at z = 0. Elements that must survive slicing
-(horizontal beams) sit at layer mid-heights via `_mid`; tube radii stay >= layer/2.
+All coordinates are metres, z up, ground at z = 0. Tube radii stay >= layer/2.
 """
 from __future__ import annotations
 
@@ -15,11 +12,6 @@ import math
 import numpy as np
 from shapely.geometry import Polygon, box
 from shapely.ops import unary_union
-
-
-def _mid(z: float, h: float) -> float:
-    """Snap z to the nearest layer mid-height (thin horizontal members land in one layer)."""
-    return (math.floor(z / h) + 0.5) * h
 
 
 def _snap(z: float, h: float) -> float:
@@ -42,165 +34,6 @@ def _arch_hole(x0: float, x1: float, z_spring: float, z_bottom: float, n: int = 
     a = np.linspace(0.0, math.pi, n)
     head = np.column_stack([c + r * np.cos(a), z_spring + r * np.sin(a)])
     return Polygon([(x1, z_bottom), *head.tolist(), (x0, z_bottom)])
-
-
-# ----------------------------------------------------------------------------- eiffel
-
-def eiffel(p: dict, rng) -> list[dict]:
-    H = float(p.get("height", 96.0))
-    h = float(p.get("layer", 0.5))
-    chord = float(p.get("chord", 0.4))
-    brace = float(p.get("brace", 0.28))
-    # outer half-width w(z) and leg half-width a(z), normalised by H (after the real tower)
-    zf = np.array([0.0, 0.10, 0.19, 0.30, 0.385])
-    wf = np.array([0.208, 0.158, 0.117, 0.085, 0.067]) * float(p.get("spread", 1.0))
-    af = np.array([0.0435, 0.041, 0.038, 0.035, 0.0335])
-    z1, z2 = _snap(0.19 * H, h), _snap(0.385 * H, h)
-    w = lambda z: float(np.interp(z / H, zf, wf)) * H
-    a = lambda z: min(float(np.interp(z / H, zf, af)) * H, 0.5 * w(z))
-    c = lambda z: w(z) - a(z)
-    sz = np.array([0.385, 0.5, 0.7, 0.92, 0.95])
-    sw = np.array([wf[-1], 0.048, 0.028, 0.016, 0.014])
-    ws = lambda z: float(np.interp(z / H, sz, sw)) * H
-    z3 = _snap(0.92 * H, h)
-    out: list[dict] = []
-
-    def truss(cx, cy, half, z_lo, z_hi, sx, sy):
-        """Square lattice between z_lo..z_hi: centre (cx(z), cy(z)), half-width half(z);
-        sx, sy flip the quadrant. Chords + rings + X-bracing on all 4 faces."""
-        zs = np.linspace(z_lo, z_hi, max(2, int((z_hi - z_lo) / 2.0) + 1))
-        for ex in (-1, 1):
-            for ey in (-1, 1):
-                out.append(_tube([(sx * (cx(z) + ex * (half(z) - chord)),
-                                   sy * (cy(z) + ey * (half(z) - chord)), z) for z in zs], chord, kind="column"))
-        levels = [z_lo]
-        while True:
-            nz = _mid(levels[-1] + max(1.6 * half(levels[-1]), 3.0), h)
-            if nz > z_hi - 2.0:
-                break
-            levels.append(nz)
-        levels = levels[1:]
-        for zl in levels:
-            C = [(sx * (cx(zl) + ex * (half(zl) - chord)), sy * (cy(zl) + ey * (half(zl) - chord)), zl)
-                 for ex, ey in ((-1, -1), (1, -1), (1, 1), (-1, 1))]
-            for i in range(4):
-                out.append(_tube([C[i], C[(i + 1) % 4]], brace + 0.05))
-        bounds = [z_lo] + levels + [z_hi]
-        for zl, zu in zip(bounds[:-1], bounds[1:]):
-            def corner(z, ex, ey):
-                return (sx * (cx(z) + ex * (half(z) - chord)), sy * (cy(z) + ey * (half(z) - chord)), z)
-            for (e0, e1) in (((-1, -1), (1, -1)), ((1, -1), (1, 1)), ((1, 1), (-1, 1)), ((-1, 1), (-1, -1))):
-                out.append(_tube([corner(zl, *e0), corner(zu, *e1)], brace))
-                out.append(_tube([corner(zl, *e1), corner(zu, *e0)], brace))
-
-    # four legs, base to the second platform
-    for sx in (-1, 1):
-        for sy in (-1, 1):
-            truss(c, c, a, 0.0, z2, sx, sy)
-            cx0, a0 = c(0.0), a(0.0)
-            out.append(_box(sx * cx0 - a0 - 0.6, sy * cx0 - a0 - 0.6, 0.0,
-                            sx * cx0 + a0 + 0.6, sy * cx0 + a0 + 0.6, 2.0, mat="concrete", kind="column"))
-    # decorative arches under the first platform, one per face
-    zs_ = _snap(0.05 * H, h)
-    t = np.linspace(0.0, math.pi, 25)
-    for along_x, side in ((True, -1), (True, 1), (False, -1), (False, 1)):
-        pts = []
-        for tt in t:
-            zz = zs_ + (z1 - 0.5 * h - zs_) * math.sin(tt)   # crown in the layer under platform 1
-            u = (c(zz) - a(zz) + 0.4) * math.cos(tt)      # across the face, leg to leg
-            v = side * (w(zz) - chord)                     # in the (sloping) outer face
-            pts.append((u, v, zz) if along_x else (v, u, zz))
-        out.append(_tube(pts, 0.35, kind="beam"))
-    # platforms (rings with a central void) and the shaft
-    for zp, wo, wi, th in ((z1, w(z1) + 1.6, max(c(z1) - a(z1) - 0.5, 2.0), 1.0),
-                           (z2, w(z2) + 1.2, 0.45 * w(z2), 1.0)):
-        for part in (box(-wo, -wo, wo, -wi), box(-wo, wi, wo, wo), box(-wo, -wi, -wi, wi), box(wi, -wi, wo, wi)):
-            x0, y0, x1, y1 = part.bounds
-            out.append(_box(x0, y0, zp, x1, y1, zp + th, mat="metal", kind="floor"))
-        for x0, y0, x1, y1 in ((-wo, -wo, wo, -wo + 0.3), (-wo, wo - 0.3, wo, wo),
-                               (-wo, -wo + 0.3, -wo + 0.3, wo - 0.3), (wo - 0.3, -wo + 0.3, wo, wo - 0.3)):
-            out.append(_box(x0, y0, zp + th, x1, y1, zp + th + 1.0, mat="metal", kind="parapet"))
-    zero = lambda z: 0.0
-    truss(zero, zero, ws, z2 + 1.0, z3, 1, 1)
-    # top cabin, lantern and spire
-    wc = ws(z3) + 0.8
-    out.append(_box(-wc, -wc, z3, wc, wc, z3 + 3.0, mat="metal", kind="floor"))
-    out.append({"lathe": {"center": [0, 0], "sides": 4, "profile": [[z3 + 3.0, wc - 0.6], [z3 + 6.0, 1.0]]},
-                "material": "metal", "kind": "roof"})
-    out.append(_tube([(0, 0, z3 + 5.5), (0, 0, H)], 0.35, kind="column", section="round"))
-    return out
-
-
-# ----------------------------------------------------------------------------- suspension bridge
-
-def suspension_bridge(p: dict, rng) -> list[dict]:
-    L = float(p.get("span", 110.0))
-    Ls = float(p.get("side_ratio", 0.4)) * L
-    h = float(p.get("layer", 0.5))
-    zd = _snap(float(p.get("deck_z", 16.0)), h)            # deck underside
-    W = float(p.get("width", 14.0))
-    zt = _snap(zd + float(p.get("tower_ratio", 0.17)) * L + 6.0, h)  # tower top
-    hanger_dx = float(p.get("hanger_spacing", 5.0))
-    tower_mat = p.get("tower_material", "metal")
-    td = 1.0                                           # deck thickness
-    gw = 1.0                                           # edge (stiffening) girder width
-    gd = float(p.get("girder_depth", 3.0))             # girder depth below the deck
-    yc = W / 2 + 0.5 * gw                              # cable / edge girder line
-    yl = W / 2 + gw + 1.5                              # tower leg centre (legs clear the girders)
-    lw = 1.4                                           # leg half-width at the base
-    out: list[dict] = []
-    x_lo, x_hi = -Ls, L + Ls
-    # deck + edge girders (girders stand 1.5 m above the deck as rails)
-    out.append(_box(x_lo, -W / 2, zd, x_hi, W / 2, zd + td, kind="floor"))
-    for s in (-1, 1):
-        y0, y1 = sorted([s * W / 2, s * (W / 2 + gw)])
-        out.append(_box(x_lo, y0, zd - gd, x_hi, y1, zd + td + 1.5, mat="metal", kind="beam"))
-    # towers: tapered legs, pier, portal beams
-    for xt in (0.0, L):
-        out.append(_box(xt - 4.0, -yl - 4.0, 0.0, xt + 4.0, yl + 4.0, 4.0, kind="column"))
-        for s in (-1, 1):
-            out.append({"lathe": {"center": [xt, s * yl], "sides": 4,
-                                  "profile": [[4.0, lw], [zt, lw * 0.7]]}, "material": tower_mat, "kind": "column"})
-        portals = [zd - gd - 1.0, _snap(zd + 0.45 * (zt - zd), h), _snap(zd + 0.8 * (zt - zd), h), zt - 2.5]
-        for zp in portals:
-            out.append(_box(xt - 1.0, -yl, zp, xt + 1.0, yl, zp + 2.0, mat=tower_mat, kind="beam"))
-        out.append(_box(xt - 1.5, -yl - 0.9, zt, xt + 1.5, yl + 0.9, zt + 1.0, mat=tower_mat, kind="beam"))
-    # cables: parabolic main span, side spans down to the anchorages
-    zc_top = zt + 1.0 + 0.45
-    z_sag = zd + td + 1.5 + 2.0
-    za = zd + td + 3.5                                 # cables end in anchor blocks just past the deck
-    xa = x_lo - 4.0                                    # ends, so they never cross the deck
-
-    def cable_z(x):
-        if 0.0 <= x <= L:
-            u = x / L
-            return zc_top - 4.0 * (zc_top - z_sag) * u * (1 - u)
-        x0, x1 = (xa, 0.0) if x < 0 else (L, L - xa)
-        za_, zb = (za, zc_top) if x < 0 else (zc_top, za)
-        u = (x - x0) / (x1 - x0)
-        return za_ + (zb - za_) * u - 0.06 * (x1 - x0) * 4 * u * (1 - u)
-
-    xs = np.concatenate([np.linspace(xa, 0.0, 16), np.linspace(0.0, L, 40)[1:], np.linspace(L, L - xa, 16)[1:]])
-    for s in (-1, 1):
-        out.append(_tube([(x, s * yc, cable_z(x)) for x in xs], 0.45, kind="beam", section="round"))
-    # anchorages (the cables end in them) + deck-end abutment walls
-    for side in (-1, 1):
-        xe = x_lo if side < 0 else x_hi
-        xb = xa if side < 0 else L - xa
-        out.append(_box(xb - 3.0, -yc - 1.5, 0.0, xb + 3.0, -yc + 1.5, za + 1.5, kind="column", mirror=["y"]))
-        x0, x1 = sorted([xe, xe - side * 3.0])          # under the deck end: girders + deck rest on it
-        out.append(_box(x0, -W / 2 - gw, 0.0, x1, W / 2 + gw, zd - gd, kind="column"))
-        out.append(_box(x0, -W / 2, zd - gd, x1, W / 2, zd, kind="column"))
-    # hangers
-    for s in (-1, 1):
-        x = x_lo + hanger_dx
-        while x < x_hi - hanger_dx * 0.5:
-            if min(abs(x), abs(x - L)) > 2.5:
-                ztop = cable_z(x)
-                if ztop > zd + td + 2.0:
-                    out.append(_tube([(x, s * yc, zd + td + 1.5), (x, s * yc, ztop)], 0.25, kind="beam"))
-            x += hanger_dx
-    return out
 
 
 # ----------------------------------------------------------------------------- aqueduct
@@ -317,4 +150,4 @@ def colossus(p: dict, rng) -> list[dict]:
     return out
 
 
-TEMPLATES = {"eiffel": eiffel, "suspension_bridge": suspension_bridge, "aqueduct": aqueduct, "colossus": colossus}
+TEMPLATES = {"aqueduct": aqueduct, "colossus": colossus}

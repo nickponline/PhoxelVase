@@ -51,6 +51,7 @@ const HELP_ROWS: &[(&str, &str, Option<Toggle>)] = &[
     ("Space", "jump (Shift run)", None),
     ("G", "demolish at cursor", None),
     ("X", "demolish", None),
+    ("Z", "demolish interior", None),
     ("R", "reset", None),
     ("P", "pause", Some(Toggle::Pause)),
     (".", "step", None),
@@ -65,7 +66,7 @@ const HELP_ROWS: &[(&str, &str, Option<Toggle>)] = &[
     ("H", "help", None),
 ];
 /// Help row after which the dynamic-tint legend is drawn.
-const TINT_ROW: usize = 15;
+const TINT_ROW: usize = 16;
 const _: () = assert!(matches!(HELP_ROWS[TINT_ROW].2, Some(Toggle::Tint)));
 /// Yellow cross drawn on chunks waiting out their collapse delay (part of the tint overlay).
 const DETACHING_COLOR: Color = Color::srgb(1.0, 1.0, 0.2);

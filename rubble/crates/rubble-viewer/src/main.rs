@@ -253,6 +253,7 @@ struct Shot {
     /// record mode: save a frame every this many ticks into `path` (a directory)
     record_every: Option<u32>,
     demolish_frame: Option<u32>,
+    interior_frame: Option<u32>,
     warmup: f32,
     /// frames rendered since the last capture was requested (record mode exits after a few)
     done_frames: u32,
@@ -365,6 +366,7 @@ fn main() {
             path: path.clone(),
             record_every: args.record.as_ref().map(|_| args.record_every),
             demolish_frame: args.demolish_frame,
+            interior_frame: args.interior_frame,
             warmup: args.warmup,
             done_frames: 0,
             frames: args.frames,
@@ -377,7 +379,9 @@ fn main() {
             requested: false,
             target: None,
         })
-        .add_systems(Update, screenshot_driver.before(render::sync_render).after(controls));
+        .add_systems(Update, screenshot_driver.before(render::sync_render).after(controls))
+        // the capture window still gets focus and keystrokes; a scripted run must not react
+        .add_systems(PreUpdate, ignore_input.after(bevy::input::InputSystems));
     } else {
         app.add_systems(FixedUpdate, fixed_step);
     }
@@ -670,16 +674,15 @@ fn controls(
         let a = side * std::f32::consts::FRAC_PI_2 + ((seed >> 1) % 61) as f32 / 60.0 * 1.0 - 0.5;
         let (sn, cs) = a.sin_cos();
         let fall = [cs * view[0] - sn * view[1], sn * view[0] + cs * view[1]];
-        let world_centre =
-            |b: usize| to_bevy(sim.world.buildings[b].pose.transform_point(rubble_core::Vec3::from_array(sim.centres[b].to_array())).to_array());
-        let targets: Vec<usize> = match hit.0 {
-            Some(p) => (0..sim.world.buildings.len())
-                .min_by(|&a, &b| world_centre(a).xz().distance(p.xz()).total_cmp(&world_centre(b).xz().distance(p.xz())))
-                .into_iter()
-                .collect(),
-            None => (0..sim.world.buildings.len()).collect(),
-        };
+        let targets = target_buildings(&sim, hit.0);
         demolish_buildings(&mut sim, &mut fx, &targets, fall, seed);
+    }
+    // Z: interior demolition of the building under the cursor (all of them if on nothing):
+    // random explosions on every floor and the roof
+    if keys.just_pressed(KeyCode::KeyZ) {
+        let seed = (sim.world.time * 1000.0) as u32 ^ sim.queued.len() as u32 ^ 0x5A5A;
+        let targets = target_buildings(&sim, hit.0);
+        demolish_interior(&mut sim, &mut fx, &targets, seed);
     }
     // LMB (hold): cutting beam through everything in line, while the button is down
     sim.beam = None;
@@ -697,7 +700,31 @@ fn controls(
     }
 }
 
-/// Screenshot mode: one engine tick per rendered frame, scripted explosion, capture, exit.
+/// The building nearest (horizontally) to the cursor hit `p`, or every building when the
+/// cursor is on nothing.
+fn target_buildings(sim: &Sim, p: Option<Vec3>) -> Vec<usize> {
+    let world_centre =
+        |b: usize| to_bevy(sim.world.buildings[b].pose.transform_point(rubble_core::Vec3::from_array(sim.centres[b].to_array())).to_array());
+    match p {
+        Some(p) => (0..sim.world.buildings.len())
+            .min_by(|&a, &b| world_centre(a).xz().distance(p.xz()).total_cmp(&world_centre(b).xz().distance(p.xz())))
+            .into_iter()
+            .collect(),
+        None => (0..sim.world.buildings.len()).collect(),
+    }
+}
+
+/// Z: queue random explosions on every floor and the roof of `targets`.
+fn demolish_interior(sim: &mut Sim, fx: &mut Fx, targets: &[usize], seed: u32) {
+    let t0 = sim.world.time;
+    for &b in targets {
+        for k in demolish::interior_charges(&sim.world, b, seed.wrapping_add(b as u32)) {
+            fx.blasts.push((to_bevy(k.blast.center), k.blast.radius, -k.delay));
+            sim.queued.push((t0 + k.delay, Scheduled::Explode(k.blast)));
+        }
+    }
+}
+
 /// X: queue the demolition charges of `targets`, falling roughly along `fall` (engine xy).
 fn demolish_buildings(sim: &mut Sim, fx: &mut Fx, targets: &[usize], fall: [f32; 2], seed: u32) {
     let t0 = sim.world.time;
@@ -713,6 +740,19 @@ fn demolish_buildings(sim: &mut Sim, fx: &mut Fx, targets: &[usize], fall: [f32;
     }
 }
 
+/// Screenshot / record mode: drop this frame's keyboard and mouse input, so typing while a
+/// capture runs (its window takes focus) cannot toggle overlays or trigger demolitions.
+fn ignore_input(
+    mut keys: ResMut<ButtonInput<KeyCode>>,
+    mut mouse: ResMut<ButtonInput<MouseButton>>,
+    mut motion: ResMut<bevy::input::mouse::AccumulatedMouseMotion>,
+) {
+    keys.reset_all();
+    mouse.reset_all();
+    motion.delta = Vec2::ZERO;
+}
+
+/// Screenshot mode: one engine tick per rendered frame, scripted explosion, capture, exit.
 fn screenshot_driver(
     mut commands: Commands,
     mut shot: ResMut<Shot>,
@@ -744,6 +784,10 @@ fn screenshot_driver(
     if shot.demolish_frame == Some(shot.frame) {
         let targets: Vec<usize> = (0..sim.world.buildings.len()).collect();
         demolish_buildings(&mut sim, &mut fx, &targets, [1.0, 0.0], 7);
+    }
+    if shot.interior_frame == Some(shot.frame) {
+        let targets: Vec<usize> = (0..sim.world.buildings.len()).collect();
+        demolish_interior(&mut sim, &mut fx, &targets, 7);
     }
     if let Some(every) = shot.record_every {
         if shot.frame % every == 0 && shot.frame + 1 < shot.frames {

@@ -9,8 +9,9 @@ cd rubble && cargo run --release -p rubble-viewer -- ../assets/buildings/office_
 
 Press H in the viewer for the controls.
 
-![office_1 demolished with X](recordings/office_1.gif)
-![office_xcoarse_2 demolished with X](recordings/office_xcoarse_2.gif)
+![tower_1 demolished from the inside with Z](recordings/tower_1_z.gif)
+![colossus_1 demolished with X](recordings/colossus_1_x.gif)
+![apartment_1 demolished with X](recordings/apartment_1_x.gif)
 
 - **`bgen/`** (Python) generates buildings from YAML specs. Each building is a layout of walls, floors,
   columns, stairs, openings and roofs, cut into convex chunks joined by a graph of bonded joints.
@@ -22,6 +23,6 @@ Press H in the viewer for the controls.
   `rubble-viewer` (Bevy app), `rubble-sim` (headless runs and benchmarks), `rubble-py` (Python bindings).
 
 Building presets: office, apartment, warehouse, tower, house, kyoto.
-Free-form structures: eiffel, suspension_bridge, aqueduct, colossus.
+Free-form structures: aqueduct, colossus.
 
 `docs/explainer.html` is an illustrated walkthrough.

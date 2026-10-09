@@ -105,6 +105,85 @@ pub fn charges(w: &EngineWorld, b: usize, fall: [f32; 2], seed: u32) -> Vec<Char
     out
 }
 
+/// bgen element kinds (`ELEMENT_KINDS`) used to find levels
+const KIND_FLOOR: u16 = 2;
+const KIND_ROOF: u16 = 5;
+/// Z (interior demolition): charges per level (floor slab or roof), inclusive range
+const INTERIOR_PER_LEVEL: (u32, u32) = (2, 3);
+/// height above the slab (m)
+const INTERIOR_HEIGHT: f32 = 1.2;
+/// they go off at random times within this window (s)
+const INTERIOR_SPREAD: f32 = 1.5;
+const INTERIOR_BLAST: f32 = 4.5;
+/// slab tops closer than this (m) are one level
+const LEVEL_GAP: f32 = 1.0;
+/// buildings without floor elements: one level per this much height (m)
+const LEVEL_FALLBACK: f32 = 3.5;
+
+/// Z: a few explosions inside building `b` on every floor and on the roof, at random spots
+/// above the slabs, going off at random times. Unlike `charges` nothing is cut: the blasts do
+/// the damage and the engine decides what comes down.
+pub fn interior_charges(w: &EngineWorld, b: usize, seed: u32) -> Vec<Charge> {
+    let bd = &w.buildings[b];
+    let bld = &bd.bld;
+    let kind = |c: &rubble_core::rubble_format::ChunkRecord| bld.elements.get(c.elem as usize).map_or(u16::MAX, |e| e.kind);
+    // levels: groups of floor-slab chunks with about the same top; the roof is one more.
+    // Indestructible slabs count too: the ground floor is often a foundation slab.
+    let mut slabs: Vec<(f32, u32)> =
+        (0..bld.chunks.len()).filter(|&c| kind(&bld.chunks[c]) == KIND_FLOOR).map(|c| (bld.chunks[c].aabb_max[2], c as u32)).collect();
+    if slabs.is_empty() {
+        // no floor elements (bridges, towers of beams): bands of height over everything
+        slabs = (0..bld.chunks.len())
+            .map(|c| ((bld.chunks[c].aabb_max[2] / LEVEL_FALLBACK).floor() * LEVEL_FALLBACK, c as u32))
+            .collect();
+    }
+    slabs.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let mut levels: Vec<Vec<u32>> = vec![];
+    let mut last = f32::NEG_INFINITY;
+    for (z, c) in slabs {
+        if z - last > LEVEL_GAP || levels.is_empty() {
+            levels.push(vec![]);
+        }
+        last = z;
+        levels.last_mut().unwrap().push(c);
+    }
+    let roof: Vec<u32> = (0..bld.chunks.len()).filter(|&c| kind(&bld.chunks[c]) == KIND_ROOF).map(|c| c as u32).collect();
+    if !roof.is_empty() {
+        levels.push(roof);
+    }
+    let mut rng = seed.wrapping_mul(0x9E37_79B9) ^ 0x7F4A_7C15 | 1;
+    let mut rand = || {
+        rng ^= rng << 13;
+        rng ^= rng >> 17;
+        rng ^= rng << 5;
+        rng as f32 / u32::MAX as f32
+    };
+    let mut out = vec![];
+    for level in &levels {
+        let (lo, hi) = INTERIOR_PER_LEVEL;
+        let n = lo + ((hi - lo + 1) as f32 * rand()) as u32;
+        for _ in 0..n.min(hi) {
+            // above a random chunk of the level, so the charge is over the slab (inside)
+            let ch = &bld.chunks[level[((level.len() as f32 * rand()) as usize).min(level.len() - 1)] as usize];
+            let p = EVec3::new(ch.com[0], ch.com[1], ch.aabb_max[2] + INTERIOR_HEIGHT);
+            let big = if rand() < BIG_CHANCE { 1.6 } else { 1.0 };
+            let radius = INTERIOR_BLAST * big * (1.0 + SIZE_JITTER * (2.0 * rand() - 1.0));
+            out.push(Charge {
+                delay: INTERIOR_SPREAD * rand(),
+                blast: Explosion {
+                    center: bd.pose.transform_point(p).to_array(),
+                    radius,
+                    inner_radius: radius * 0.4,
+                    damage: 5000.0,
+                    impulse: 5000.0 * radius,
+                },
+                chunks: vec![],
+            });
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -113,6 +192,31 @@ mod tests {
 
     /// The charge plane is cut clean through and the upper floors come down without a pause,
     /// whichever side the fall side is.
+    /// Z: charges on every floor and the roof, all inside the building's footprint.
+    #[test]
+    fn interior_charges_on_every_level() {
+        let mut w = EngineWorld::new(WorldConfig::default());
+        w.load_building_bld(tower(6, 9.0, true), Isometry::new([5.0, -3.0, 0.0], 0.3));
+        let ks = interior_charges(&w, 0, 7);
+        let bd = &w.buildings[0];
+        let (mut lo, mut hi) = (EVec3::splat(f32::MAX), EVec3::splat(f32::MIN));
+        for c in &bd.bld.chunks {
+            lo = lo.min(EVec3::from_array(c.aabb_min));
+            hi = hi.max(EVec3::from_array(c.aabb_max));
+        }
+        let local: Vec<EVec3> = ks.iter().map(|k| bd.pose.inverse_transform_point(EVec3::from_array(k.blast.center))).collect();
+        for p in &local {
+            assert!(p.x >= lo.x && p.x <= hi.x && p.y >= lo.y && p.y <= hi.y, "charge {p:?} outside the footprint");
+            assert!(p.z <= hi.z + INTERIOR_HEIGHT + 0.01, "charge {p:?} above the building");
+        }
+        // one band of charges per storey (3 m) from the ground up to the top
+        let mut bands: Vec<i32> = local.iter().map(|p| (p.z / 3.0).floor() as i32).collect();
+        bands.sort();
+        bands.dedup();
+        assert!(bands.len() >= 6, "levels with charges: {bands:?}");
+        assert!(ks.iter().all(|k| k.delay >= 0.0 && k.delay <= INTERIOR_SPREAD));
+    }
+
     #[test]
     fn tower_cut_through_and_comes_down() {
         let yaw = 0.4f32;

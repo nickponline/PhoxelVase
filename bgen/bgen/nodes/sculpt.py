@@ -8,7 +8,7 @@ curved surfaces come out terraced at `layer` resolution (like a contour model).
 
 params:
   layer: 0.5                 # slice height (m); primitive z extents snap to it
-  template: eiffel           # optional parametric generator (see sculpt_templates.py),
+  template: aqueduct         # optional parametric generator (see sculpt_templates.py),
   <template params...>       #   its params may be [lo, hi] ranges sampled from the node rng
   primitives: [...]          # extra primitives, appended after the template's
   ground: {pad: 3.0, thickness: 0.3, material: concrete}   # anchor slab under the footprint

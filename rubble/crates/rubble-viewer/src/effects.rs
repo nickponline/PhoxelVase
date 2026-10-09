@@ -5,7 +5,7 @@
 //!   scene, a sun glow in the distance fog, and point lights: a flickering, shadow-casting one
 //!   where the beam hits and short flashes on explosions.
 //! * **Particles** (key 8): sparks where the beam cuts, debris bits when chunks break or heavy
-//!   pieces land hard, and fireballs, sparks and debris on explosions.
+//!   pieces land hard, and flames (soft camera-facing sprites), sparks and debris on explosions.
 //!
 //! Particles live in engine space (Z-up) and advance with engine ticks like the glass shards, so
 //! they pause with the simulation and are reproducible in screenshot mode.
@@ -40,9 +40,14 @@ pub const IMPACT_SPACING: f32 = 2.0;
 
 const MAX_PARTICLES: usize = 5000;
 const MAX_FLASHES: usize = 8;
-/// alpha steps of the fading materials (a particle swaps material, never mutates one)
-const FADE_STEPS: usize = 8;
+/// colour/alpha steps over a flame's life (a particle swaps material, never mutates one)
+const FIRE_STEPS: usize = 12;
+/// distinct flame textures (random ragged outlines)
+const FIRE_VARIANTS: usize = 4;
+const FIRE_TEX: u32 = 64;
 const GRAVITY: f32 = 9.81;
+/// sparks / bits lying on their surface re-check it every this many ticks (staggered)
+const FLOOR_RECHECK_TICKS: u64 = 6;
 
 #[derive(Clone, Copy, PartialEq)]
 enum Kind {
@@ -50,7 +55,7 @@ enum Kind {
     Spark,
     /// small tumbling cube in the chunk's colour
     Bit,
-    /// growing, fading fireball sphere
+    /// camera-facing flame sprite: grows, rises, cools from white-yellow to dark red and fades
     Fire,
 }
 
@@ -68,9 +73,13 @@ pub struct Particle {
     size1: f32,
     /// engine z of the surface below the spawn point
     floor: f32,
-    /// drag per second (fireballs expand to a stop)
+    /// drag per second (flames expand to a stop)
     drag: f32,
     step: usize,
+    /// flame sprite: texture variant, roll angle about the view axis and its rate (rad, rad/s)
+    variant: usize,
+    roll: f32,
+    roll_rate: f32,
 }
 
 #[derive(Component)]
@@ -88,12 +97,12 @@ pub struct SceneFog;
 #[derive(Resource)]
 pub struct EffectAssets {
     cube: Handle<Mesh>,
-    ball: Handle<Mesh>,
+    quad: Handle<Mesh>,
     spark: Handle<StandardMaterial>,
     /// per `rubble-format` material id (0..5), opaque
     bits: Vec<Handle<StandardMaterial>>,
-    /// fireball material per fade step, step 0 = most opaque
-    fire: Vec<Handle<StandardMaterial>>,
+    /// flame material per [texture variant][life step]
+    fire: Vec<Vec<Handle<StandardMaterial>>>,
 }
 
 /// Tick the particles were last advanced to, and a deterministic RNG.
@@ -132,6 +141,7 @@ pub fn setup_effects(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut mats: ResMut<Assets<StandardMaterial>>,
+    mut images: ResMut<Assets<Image>>,
     spec: Res<WorldSpec>,
 ) {
     // glow colours are set for the current lighting by `apply_lighting`
@@ -140,20 +150,29 @@ pub fn setup_effects(
         .into_iter()
         .map(|[r, g, b]| mats.add(StandardMaterial { base_color: Color::srgb(r, g, b), perceptual_roughness: 0.95, ..default() }))
         .collect();
-    let fire = (0..FADE_STEPS)
-        .map(|s| {
-            let a = 1.0 - s as f32 / FADE_STEPS as f32;
-            mats.add(StandardMaterial {
-                base_color: fire_color(false, a),
-                unlit: true,
-                alpha_mode: AlphaMode::Add,
-                ..default()
-            })
+    let fire = (0..FIRE_VARIANTS)
+        .map(|v| {
+            let tex = images.add(flame_texture(0x51ed_270b ^ (v as u32 + 1).wrapping_mul(0x9e37_79b9)));
+            (0..FIRE_STEPS)
+                .map(|s| {
+                    mats.add(StandardMaterial {
+                        base_color: fire_color(false, fire_t(s)),
+                        base_color_texture: Some(tex.clone()),
+                        unlit: true,
+                        // glows (adds light) but also partly covers what is behind, so flames
+                        // still read against a brightly lit wall
+                        alpha_mode: AlphaMode::Premultiplied,
+                        double_sided: true,
+                        cull_mode: None,
+                        ..default()
+                    })
+                })
+                .collect()
         })
         .collect();
     commands.insert_resource(EffectAssets {
         cube: meshes.add(Cuboid::new(1.0, 1.0, 1.0)),
-        ball: meshes.add(Sphere::new(1.0).mesh().ico(2).unwrap()),
+        quad: meshes.add(Rectangle::new(1.0, 1.0)),
         spark,
         bits,
         fire,
@@ -209,10 +228,61 @@ fn spark_color(hdr: bool) -> Color {
     }
 }
 
-/// Fireball colour at opacity `a` (additive), as `spark_color`.
-fn fire_color(hdr: bool, a: f32) -> Color {
-    let k = if hdr { 9.0 } else { 1.0 };
-    Color::LinearRgba(LinearRgba::new(k * a, k * 0.36 * a, k * 0.07 * a, a))
+/// Life fraction (0 = just born, 1 = gone) of flame colour step `s`.
+fn fire_t(s: usize) -> f32 {
+    s as f32 / (FIRE_STEPS - 1) as f32
+}
+
+/// Flame colour at life fraction `t` (premultiplied by its alpha): white-yellow, orange, red, dark ember, fading
+/// out; over-bright with the HDR lighting on, as `spark_color`.
+fn fire_color(hdr: bool, t: f32) -> Color {
+    const RAMP: [(f32, [f32; 3]); 4] =
+        [(0.0, [1.0, 0.62, 0.2]), (0.2, [1.0, 0.4, 0.06]), (0.55, [0.75, 0.15, 0.02]), (1.0, [0.15, 0.02, 0.0])];
+    let i = RAMP.iter().rposition(|(t0, _)| *t0 <= t).unwrap_or(0).min(RAMP.len() - 2);
+    let ((t0, a), (t1, b)) = (RAMP[i], RAMP[i + 1]);
+    let f = ((t - t0) / (t1 - t0)).clamp(0.0, 1.0);
+    let c: [f32; 3] = std::array::from_fn(|j| a[j] + (b[j] - a[j]) * f);
+    // hot flames glow far more than cooling ones
+    let k = if hdr { 1.0 + 1.5 * (1.0 - t).powi(2) } else { 1.0 };
+    let alpha = (1.0 - t).powf(0.8);
+    // mostly glow: covers only this fraction of what is behind
+    const COVER: f32 = 0.4;
+    Color::LinearRgba(LinearRgba::new(k * c[0] * alpha, k * c[1] * alpha, k * c[2] * alpha, alpha * COVER))
+}
+
+/// A soft flame puff: bright mottled centre fading to a ragged transparent edge (grey levels
+/// premultiplied by alpha, tinted by the material). `seed` picks the outline.
+fn flame_texture(seed: u32) -> Image {
+    use bevy::asset::RenderAssetUsages;
+    use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
+    let mut rng = EffectState { tick: 0, rng: seed | 1, live: 0 };
+    // edge radius and interior brightness as low-order Fourier series in the angle
+    let waves: Vec<(f32, f32, f32)> = (2..7).map(|k| (k as f32, rng.range(0.0, std::f32::consts::TAU), rng.range(0.02, 0.07))).collect();
+    let mottle: Vec<(f32, f32, f32)> = (0..6)
+        .map(|_| (rng.range(-1.0, 1.0), rng.range(-1.0, 1.0), rng.range(0.0, std::f32::consts::TAU)))
+        .collect();
+    let n = FIRE_TEX as usize;
+    let mut data = vec![0u8; n * n * 4];
+    for y in 0..n {
+        for x in 0..n {
+            let (u, v) = ((x as f32 + 0.5) / n as f32 * 2.0 - 1.0, (y as f32 + 0.5) / n as f32 * 2.0 - 1.0);
+            let r = (u * u + v * v).sqrt();
+            let a = v.atan2(u);
+            let edge = 0.78 + waves.iter().map(|(k, ph, amp)| amp * (k * a + ph).sin()).sum::<f32>();
+            let fall = (1.0 - r / edge).clamp(0.0, 1.0);
+            let m = mottle.iter().map(|(fx, fy, ph)| (7.0 * (fx * u + fy * v) + ph).sin()).sum::<f32>() / mottle.len() as f32;
+            let i = (fall * fall * (3.0 - 2.0 * fall)) * (0.8 + 0.2 * m);
+            let b = (i.clamp(0.0, 1.0) * 255.0) as u8;
+            data[(y * n + x) * 4..][..4].copy_from_slice(&[b, b, b, b]);
+        }
+    }
+    Image::new(
+        Extent3d { width: FIRE_TEX, height: FIRE_TEX, depth_or_array_layers: 1 },
+        TextureDimension::D2,
+        data,
+        TextureFormat::Rgba8Unorm,
+        RenderAssetUsages::RENDER_WORLD,
+    )
 }
 
 /// Switch the camera / sun / ambient between the plain and the fancy look when the toggle
@@ -281,9 +351,11 @@ pub fn apply_lighting(
     if let Some(mut m) = mats.get_mut(&assets.spark) {
         m.base_color = spark_color(on);
     }
-    for (s, h) in assets.fire.iter().enumerate() {
-        if let Some(mut m) = mats.get_mut(h) {
-            m.base_color = fire_color(on, 1.0 - s as f32 / FADE_STEPS as f32);
+    for steps in &assets.fire {
+        for (s, h) in steps.iter().enumerate() {
+            if let Some(mut m) = mats.get_mut(h) {
+                m.base_color = fire_color(on, fire_t(s));
+            }
         }
     }
     if let Ok((_, mut v)) = volume.single_mut() {
@@ -303,6 +375,7 @@ pub fn update_effects(
     mut parts: Query<(Entity, &mut Particle, &mut Transform, &mut MeshMaterial3d<StandardMaterial>), Without<BeamLight>>,
     mut flashes: Query<(Entity, &mut Flash, &mut PointLight), Without<BeamLight>>,
     mut beam_light: Query<(&mut PointLight, &mut Transform, &mut Visibility), (With<BeamLight>, Without<Particle>)>,
+    cams: Query<&Transform, (With<Camera3d>, Without<Particle>, Without<BeamLight>)>,
 ) {
     let dt = time.delta_secs();
     let events = std::mem::take(&mut sim.fx_events);
@@ -368,14 +441,14 @@ pub fn update_effects(
             commands.spawn((
                 PointLight {
                     color: Color::srgb(1.0, 0.6, 0.25),
-                    intensity: 4.0e7 * (r / 6.0),
+                    intensity: 0.8e7 * (r / 6.0),
                     range: r * 8.0,
                     radius: r * 0.3,
                     shadow_maps_enabled: false,
                     ..default()
                 },
                 Transform::from_translation(to_bevy(p.to_array())),
-                Flash { age: 0.0, life: 0.6, peak: 4.0e7 * (r / 6.0) },
+                Flash { age: 0.0, life: 0.6, peak: 0.8e7 * (r / 6.0) },
             ));
         }
     }
@@ -392,10 +465,21 @@ pub fn update_effects(
     let mut spawn = Spawner { commands: &mut commands, assets: &assets, budget };
     for &(p, r) in &blasts {
         let floor = floor_below(p);
-        for _ in 0..8 {
+        // a short white-hot core, then ragged flames bursting outward, rising and cooling
+        for _ in 0..3 {
             let d = st.dir(Vec3::ZERO);
-            let s = st.range(0.35, 0.6) * r;
-            spawn.fire(p + d * r * 0.2, d * r * 0.8, 0.5, s * 0.3, s, 3.0, floor);
+            let s = st.range(0.9, 1.2) * r;
+            let life = st.range(0.12, 0.2);
+            spawn.fire(&mut st, p + d * r * 0.1, d * r * 0.5, life, s * 0.6, s * 1.2, 4.0, floor);
+        }
+        for _ in 0..44 {
+            let d = st.dir(Vec3::ZERO);
+            let o = d * st.range(0.0, 0.35) * r;
+            let v = d * st.range(0.6, 1.6) * r + Vec3::Z * st.range(0.0, 0.4) * r;
+            let s = st.range(0.32, 0.55) * r;
+            let life = st.range(0.35, 0.9);
+            let grow = st.range(1.4, 2.2);
+            spawn.fire(&mut st, p + o, v, life, s * 0.5, s * grow, 3.5, floor);
         }
         for _ in 0..60 {
             let d = st.dir(Vec3::ZERO);
@@ -443,11 +527,19 @@ pub fn update_effects(
     }
 
     let spawned = budget - spawn.budget;
+    // flames face the camera
+    let cam_rot = cams.single().map_or(Quat::IDENTITY, |t| t.rotation);
     // advance
     let mut live = 0;
     for (e, mut q, mut xf, mut mat) in &mut parts {
         for _ in 0..ticks {
             step(&mut q, DT);
+        }
+        // the surface under a particle is sampled once at spawn; one lying on it looks again now
+        // and then, since the surface may have been destroyed or the particle slid off its edge.
+        // It then falls to whatever is below.
+        if ticks > 0 && (st.tick + e.to_bits()).is_multiple_of(FLOOR_RECHECK_TICKS) {
+            refloor(&mut q, &floor_below);
         }
         if q.age >= q.life {
             commands.entity(e).despawn();
@@ -473,13 +565,12 @@ pub fn update_effects(
             }
             Kind::Fire => {
                 xf.translation = to_bevy(q.pos.to_array());
+                xf.rotation = cam_rot * Quat::from_rotation_z(q.roll);
                 xf.scale = Vec3::splat(size);
-                // fade in over the first 10%, out over the rest
-                let a = if k < 0.1 { 1.0 - k / 0.1 } else { (k - 0.1) / 0.9 };
-                let s = ((a * FADE_STEPS as f32) as usize).min(FADE_STEPS - 1);
+                let s = ((k * FIRE_STEPS as f32) as usize).min(FIRE_STEPS - 1);
                 if s != q.step {
                     q.step = s;
-                    mat.0 = assets.fire[s].clone();
+                    mat.0 = assets.fire[q.variant][s].clone();
                 }
             }
         }
@@ -487,11 +578,25 @@ pub fn update_effects(
     st.live = live + spawned;
 }
 
+/// A spark / bit lying on its surface takes the surface below it again (`floor_below`, engine
+/// space); when that is lower (the old one was destroyed or it slid off), it falls from there.
+fn refloor(q: &mut Particle, floor_below: &dyn Fn(Vec3) -> f32) {
+    if q.kind != Kind::Fire && q.pos.z <= q.floor + 0.01 {
+        let below = floor_below(q.pos);
+        if below < q.floor - 0.02 {
+            q.floor = below;
+        }
+    }
+}
+
 fn step(q: &mut Particle, dt: f32) {
     q.age += dt;
     match q.kind {
         Kind::Fire => {
             q.vel *= (1.0 - q.drag * dt).max(0.0);
+            // hot gas rises
+            q.vel.z += 3.0 * dt;
+            q.roll += q.roll_rate * dt;
             q.pos += q.vel * dt;
             q.pos.z = q.pos.z.max(q.floor + q.size1 * 0.3);
         }
@@ -529,7 +634,7 @@ impl Spawner<'_, '_, '_> {
 
     fn spark(&mut self, st: &mut EffectState, pos: Vec3, vel: Vec3, life: f32, floor: f32) {
         let size0 = st.range(0.015, 0.03);
-        let p = Particle { kind: Kind::Spark, pos, vel, rot: Quat::IDENTITY, spin: Vec3::ZERO, age: 0.0, life, size0, size1: size0, floor, drag: 0.0, step: 0 };
+        let p = Particle { kind: Kind::Spark, pos, vel, rot: Quat::IDENTITY, spin: Vec3::ZERO, age: 0.0, life, size0, size1: size0, floor, drag: 0.0, step: 0, variant: 0, roll: 0.0, roll_rate: 0.0 };
         self.emit(p, &self.assets.cube.clone(), self.assets.spark.clone());
     }
 
@@ -537,15 +642,34 @@ impl Spawner<'_, '_, '_> {
         let spin = st.dir(Vec3::ZERO) * st.range(3.0, 12.0);
         let rot = Quat::from_scaled_axis(st.dir(Vec3::ZERO) * 3.0);
         let life = st.range(2.5, 4.5);
-        let p = Particle { kind: Kind::Bit, pos, vel, rot, spin, age: 0.0, life, size0: size, size1: size, floor, drag: 0.0, step: 0 };
+        let p = Particle { kind: Kind::Bit, pos, vel, rot, spin, age: 0.0, life, size0: size, size1: size, floor, drag: 0.0, step: 0, variant: 0, roll: 0.0, roll_rate: 0.0 };
         let m = self.assets.bits[(material as usize).min(self.assets.bits.len() - 1)].clone();
         self.emit(p, &self.assets.cube.clone(), m);
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn fire(&mut self, pos: Vec3, vel: Vec3, life: f32, size0: f32, size1: f32, drag: f32, floor: f32) {
-        let p = Particle { kind: Kind::Fire, pos, vel, rot: Quat::IDENTITY, spin: Vec3::ZERO, age: 0.0, life, size0, size1, floor, drag, step: FADE_STEPS - 1 };
-        self.emit(p, &self.assets.ball.clone(), self.assets.fire[FADE_STEPS - 1].clone());
+    fn fire(&mut self, st: &mut EffectState, pos: Vec3, vel: Vec3, life: f32, size0: f32, size1: f32, drag: f32, floor: f32) {
+        let variant = (st.next() * FIRE_VARIANTS as f32) as usize % FIRE_VARIANTS;
+        let roll = st.range(0.0, std::f32::consts::TAU);
+        let roll_rate = st.range(-1.5, 1.5);
+        let p = Particle {
+            kind: Kind::Fire,
+            pos,
+            vel,
+            rot: Quat::IDENTITY,
+            spin: Vec3::ZERO,
+            age: 0.0,
+            life,
+            size0,
+            size1,
+            floor,
+            drag,
+            step: 0,
+            variant,
+            roll,
+            roll_rate,
+        };
+        self.emit(p, &self.assets.quad.clone(), self.assets.fire[variant][0].clone());
     }
 }
 
@@ -555,5 +679,45 @@ pub type EffectFilter = Or<(With<Particle>, With<Flash>)>;
 pub fn clear_effects(commands: &mut Commands, parts: &Query<Entity, EffectFilter>) {
     for e in parts {
         commands.entity(e).despawn();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A bit lying on a slab that is then destroyed falls to the ground instead of hanging in
+    /// the air where the slab was.
+    #[test]
+    fn resting_bit_falls_when_its_surface_goes() {
+        let mut q = Particle {
+            kind: Kind::Bit,
+            pos: Vec3::new(1.0, 2.0, 5.5),
+            vel: Vec3::ZERO,
+            rot: Quat::IDENTITY,
+            spin: Vec3::ZERO,
+            age: 0.0,
+            life: 10.0,
+            size0: 0.1,
+            size1: 0.1,
+            floor: 5.0,
+            drag: 0.0,
+            step: 0,
+            variant: 0,
+            roll: 0.0,
+            roll_rate: 0.0,
+        };
+        let mut slab = true;
+        let mut run = |q: &mut Particle, slab: bool, secs: f32| {
+            for _ in 0..(secs / DT) as usize {
+                step(q, DT);
+                refloor(q, &|_| if slab { 5.0 } else { 0.0 });
+            }
+        };
+        run(&mut q, slab, 1.0);
+        assert!((q.pos.z - 5.0).abs() < 1e-3, "settles on the slab: {}", q.pos.z);
+        slab = false;
+        run(&mut q, slab, 2.0);
+        assert!(q.pos.z.abs() < 1e-3, "falls to the ground once the slab is gone: {}", q.pos.z);
     }
 }

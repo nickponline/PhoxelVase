@@ -160,7 +160,7 @@ fn fuzz(name: &str, seed: u64, secs: f32) -> Vec<String> {
 fn fuzz_nothing_hangs() {
     let seeds: u64 = std::env::var("FUZZ_SEEDS").ok().and_then(|s| s.parse().ok()).unwrap_or(2);
     let only = std::env::var("FUZZ_ONLY").ok();
-    let names = ["house_1", "kyoto_1", "warehouse_1", "office_1", "apartment_1", "tower_1", "eiffel_1", "suspension_bridge_1", "aqueduct_1", "colossus_1"];
+    let names = ["house_1", "kyoto_1", "warehouse_1", "office_1", "apartment_1", "tower_1", "aqueduct_1", "colossus_1"];
     let mut bad = vec![];
     for name in names {
         if only.as_deref().is_some_and(|o| !name.starts_with(o)) {
