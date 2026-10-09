@@ -72,6 +72,11 @@ pub trait PhysicsBackend {
     fn set_gravity(&mut self, g: Vec3);
     /// Continuous collision detection for fast dynamic bodies (expensive against many static hulls).
     fn set_ccd(&mut self, enabled: bool);
+    /// Continuous collision detection for one body (only runs while `set_ccd(true)`).
+    fn set_body_ccd(&mut self, b: BodyId, enabled: bool);
+    /// Predictive ("soft") collision detection for one body: contacts are looked for this far
+    /// ahead along its path (m), 0 = off. Much cheaper than `set_body_ccd`.
+    fn set_body_soft_ccd(&mut self, b: BodyId, distance: f32);
     fn set_solver_iterations(&mut self, iters: usize);
     fn convex_hull(points: &[Vec3]) -> Option<Shape>
     where
@@ -197,6 +202,18 @@ impl PhysicsBackend for RapierBackend {
 
     fn set_ccd(&mut self, enabled: bool) {
         self.world.integration_parameters.max_ccd_substeps = enabled as usize;
+    }
+
+    fn set_body_ccd(&mut self, b: BodyId, enabled: bool) {
+        if let Some(rb) = self.world.bodies.get_mut(b.0) {
+            rb.enable_ccd(enabled);
+        }
+    }
+
+    fn set_body_soft_ccd(&mut self, b: BodyId, distance: f32) {
+        if let Some(rb) = self.world.bodies.get_mut(b.0) {
+            rb.set_soft_ccd_prediction(distance);
+        }
     }
 
     fn set_solver_iterations(&mut self, iters: usize) {

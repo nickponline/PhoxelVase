@@ -107,6 +107,11 @@ pub struct Cluster {
     /// known to be one connected piece (set by a full rebuild; a new cluster may not be, e.g.
     /// after its glass shattered)
     pub connected: bool,
+    /// predictive collision detection is on for its body (see `WorldConfig::ccd_speed`)
+    pub ccd: bool,
+    /// velocity at the last tick with no landing under way (`impact_dv` near zero): what it
+    /// hit with, unaffected by the contact solver's push-out impulses during the landing
+    pub v_quiet: Vec3,
 }
 
 struct ImpactResult {
@@ -572,6 +577,8 @@ impl World {
         self.timings.promotion_ms = lap(&mut t);
         // 7. physics (first wake / thaw anything whose support was removed this tick)
         self.thaw_unsupported();
+        self.update_ccd(dt);
+        self.record_quiet_velocities();
         self.phys.step(dt);
         self.timings.physics_ms = lap(&mut t);
         // 8. impacts
@@ -584,6 +591,46 @@ impl World {
         self.time += dt;
         self.tick += 1;
         self.timings.total_ms = t_start.elapsed().as_secs_f32() * 1e3;
+    }
+
+    /// Before the physics step: a cluster with no landing under way remembers its velocity, so a
+    /// landing (which may happen within this one step) is judged by how fast it hit, not by the
+    /// contact solver's push-out impulses while it settles (see `crush_front`).
+    fn record_quiet_velocities(&mut self) {
+        for (_, cl) in self.clusters.iter_mut() {
+            if cl.impact_dv.length_squared() < 0.25 {
+                cl.v_quiet = self.phys.body_state(cl.body).linvel;
+            }
+        }
+    }
+
+    /// Anti-tunneling only where it is needed. Small pieces (`ccd_max_chunks`) faster than
+    /// `ccd_speed` get predictive contacts one step's travel ahead (plus a margin), so fast
+    /// debris stops on thin slabs instead of passing through; the slow majority and big
+    /// sections pay nothing. `ccd` instead sweeps every body (full CCD, expensive).
+    fn update_ccd(&mut self, dt: f32) {
+        let always = self.cfg.ccd;
+        self.phys.set_ccd(always);
+        let v = self.cfg.ccd_speed.max(0.0);
+        let max_chunks = self.cfg.ccd_max_chunks;
+        for (_, cl) in self.clusters.iter_mut() {
+            if always && !cl.ccd {
+                self.phys.set_body_ccd(cl.body, true);
+                cl.ccd = true;
+            }
+            if always || v <= 0.0 || cl.chunks.len() > max_chunks {
+                continue;
+            }
+            let s = self.phys.body_state(cl.body);
+            let speed = s.linvel.length();
+            if !s.sleeping && speed > v {
+                self.phys.set_body_soft_ccd(cl.body, speed * dt * 1.5 + 0.1);
+                cl.ccd = true;
+            } else if cl.ccd {
+                self.phys.set_body_soft_ccd(cl.body, 0.0);
+                cl.ccd = false;
+            }
+        }
     }
 
     // ------------------------------------------------------------------ 1. projectiles
@@ -809,6 +856,8 @@ impl World {
             let this = &*self;
             exps.par_iter().map(|e| this.explosion_effects(e)).collect()
         };
+        // pushes on frozen rubble: (building, chunk, impulse, point)
+        let mut rubble: Vec<(u32, u32, Vec3, Vec3)> = vec![];
         for f in fx {
             self.damage.extend(f.damage);
             self.edge_damage.extend(f.edge_damage);
@@ -828,9 +877,39 @@ impl World {
                         bd.pending_impulse[cu] = a3(p);
                         bd.pending_impulse_t[cu] = self.time;
                     }
+                    ChunkState::Frozen => rubble.push((b, c, j, com)),
                     _ => {}
                 }
             }
+        }
+        self.blast_rubble(rubble);
+    }
+
+    /// Frozen rubble is static, so a blast would only damage it. Every frozen group with a chunk
+    /// pushed harder than `blast_thaw_dv` thaws back into a moving piece (as when its support
+    /// goes), starting with the velocity all its pushes give it; it settles and freezes again later.
+    fn blast_rubble(&mut self, pushes: Vec<(u32, u32, Vec3, Vec3)>) {
+        let min_dv = self.cfg.blast_thaw_dv;
+        if min_dv <= 0.0 || pushes.is_empty() {
+            return;
+        }
+        for &(b, c, j, _) in &pushes {
+            let bd = &self.buildings[b as usize];
+            if bd.state[c as usize] != ChunkState::Frozen || j.length() < min_dv * bd.bld.chunks[c as usize].mass {
+                continue;
+            }
+            let group = self.frozen_group(b, c);
+            let bd = &self.buildings[b as usize];
+            let pose = bd.chunk_pose[c as usize];
+            let mass: f32 = group.iter().map(|&g| bd.bld.chunks[g as usize].mass).sum();
+            let debris = mass < self.cfg.freeze_min_mass;
+            // all pushes on the group, including weaker ones on its other chunks
+            let members: std::collections::HashSet<u32> = group.iter().copied().collect();
+            let on_group: Vec<(Vec3, Vec3)> =
+                pushes.iter().filter(|p| p.0 == b && members.contains(&p.1)).map(|p| (p.2, p.3)).collect();
+            let (linvel, angvel) = self.velocity_from_impulses(b, &group, pose, &on_group);
+            let k = self.create_cluster(b, group, pose, linvel, angvel, debris);
+            self.emit_detached(k);
         }
     }
 
@@ -1026,6 +1105,11 @@ impl World {
     /// Chunk HP reached zero: remove it from the static set / its cluster, then either
     /// spawn small dynamic debris or shatter it.
     fn remove_chunk(&mut self, b: u32, c: u32) {
+        self.remove_chunk_as(b, c, true);
+    }
+
+    /// `remove_chunk`; with `allow_debris` false it always shatters (pulverized).
+    fn remove_chunk_as(&mut self, b: u32, c: u32, allow_debris: bool) {
         let cu = c as usize;
         let min_vol = self.debris_min_volume();
         let (keep, max_clusters) = (self.cfg.keep_debris, self.max_clusters());
@@ -1072,7 +1156,8 @@ impl World {
         let ch = bd.bld.chunks[cu];
         // debris that is destroyed again shatters (no debris-of-debris)
         let was_debris = matches!(st, ChunkState::InCluster(k) if self.clusters.get(k).map_or(false, |c| c.debris));
-        let can_debris = !was_debris
+        let can_debris = allow_debris
+            && !was_debris
             && !bd.glass(cu)
             && ch.flags & F_NO_DEBRIS == 0
             && ch.volume >= min_vol
@@ -1485,24 +1570,32 @@ impl World {
         }
         // initial velocity from recent explosion impulses
         let pose = bd.pose;
-        let mp = self.mass_props(b, &keep);
+        let pushes: Vec<(Vec3, Vec3)> = keep
+            .iter()
+            .filter(|&&c| self.time - bd.pending_impulse_t[c as usize] <= self.cfg.impulse_memory)
+            .map(|&c| (v3(bd.pending_impulse[c as usize]), pose.transform_point(v3(bd.bld.chunks[c as usize].com))))
+            .collect();
+        let (linvel, angvel) = self.velocity_from_impulses(b, &keep, pose, &pushes);
+        let k = self.create_cluster(b, keep, pose, linvel, angvel, false);
+        self.emit_detached(k);
+    }
+
+    /// Velocity (linear, angular) a rigid piece of `chunks` at `pose` starts with after the
+    /// impulses `pushes` (impulse, world point). A body created this tick has no mass yet, so
+    /// impulses must become its initial velocity rather than be applied to it.
+    fn velocity_from_impulses(&self, b: u32, chunks: &[u32], pose: Pose, pushes: &[(Vec3, Vec3)]) -> (Vec3, Vec3) {
+        let mp = self.mass_props(b, chunks);
         let com_w = pose.transform_point(mp.local_com);
         let (mut jl, mut ja) = (Vec3::ZERO, Vec3::ZERO);
-        for &c in &keep {
-            let cu = c as usize;
-            if self.time - bd.pending_impulse_t[cu] <= self.cfg.impulse_memory {
-                let j = v3(bd.pending_impulse[cu]);
-                let p = pose.transform_point(v3(bd.bld.chunks[cu].com));
-                jl += j;
-                ja += (p - com_w).cross(j);
-            }
+        for &(j, p) in pushes {
+            jl += j;
+            ja += (p - com_w).cross(j);
         }
         let linvel = jl / mp.mass.max(1e-3);
         let r = Mat3::from_quat(pose.rotation);
         let iw = r * mp.inertia * r.transpose();
         let angvel = if iw.determinant().abs() > 1e-9 { iw.inverse() * ja } else { Vec3::ZERO };
-        let k = self.create_cluster(b, keep, pose, linvel, angvel, false);
-        self.emit_detached(k);
+        (linvel, angvel)
     }
 
     fn shatter_static(&mut self, b: u32, c: u32) {
@@ -1566,6 +1659,8 @@ impl World {
             impact_dv: Vec3::ZERO,
             broken: vec![],
             connected: false,
+            ccd: false,
+            v_quiet: linvel,
         });
         for &c in &chunks {
             let cu = c as usize;
@@ -1919,6 +2014,9 @@ impl World {
             let t = self.time;
             for (k, sup, dv) in impact_jobs {
                 self.clusters[k].last_impact = t;
+                if self.crush_front(k, &sup, dv) {
+                    continue;
+                }
                 let job = self.impact_job(k, &sup, dv);
                 let (tx, rx) = std::sync::mpsc::channel();
                 if self.cfg.impact_latency_ticks == 0 {
@@ -1982,6 +2080,80 @@ impl World {
         if debug_impact() && t0.elapsed().as_secs_f32() > 1e-3 {
             eprintln!("rebuild clusters {:.2} ms ({} clusters)", t0.elapsed().as_secs_f32() * 1e3, self.clusters.len());
         }
+    }
+
+    /// Progressive collapse (see `WorldConfig::crush_band`). A tall cluster that has just landed
+    /// with velocity change `dvv` (pointing away from what it hit) on `supports`: if its kinetic
+    /// energy before the landing exceeds the crush energy of the band at its base, the band is
+    /// crushed (pulverized now, a few pieces kept as debris) and the cluster is sent on with the velocity the remaining
+    /// energy allows, so it drops onto the next storey and the front moves up through it.
+    /// Returns false (nothing done) when it is too short or the band can take the hit.
+    fn crush_front(&mut self, k: ClusterKey, supports: &[u32], dvv: Vec3) -> bool {
+        let (band, min_extent) = (self.cfg.crush_band, self.cfg.crush_min_extent);
+        if band <= 0.0 || supports.is_empty() {
+            return false;
+        }
+        let Some(cl) = self.clusters.get(k) else { return false };
+        let b = cl.building;
+        let bd = &self.buildings[b as usize];
+        let st = self.phys.body_state(cl.body);
+        let up = dvv.try_normalize().unwrap_or(Vec3::Z);
+        let h = |c: u32| st.pose.transform_point(v3(bd.bld.chunks[c as usize].com)).dot(up);
+        let base = supports.iter().map(|&c| h(c)).fold(f32::INFINITY, f32::min);
+        let top = cl.chunks.iter().map(|&c| h(c)).fold(f32::NEG_INFINITY, f32::max);
+        if top - base < min_extent {
+            return false;
+        }
+        let in_band = |c: u32| h(c) <= base + band;
+        let crushed: Vec<u32> = cl.chunks.iter().copied().filter(|&c| in_band(c)).collect();
+        // load-bearing bonds of the band: along the impact, touching a band chunk
+        let mut capacity = 0.0f64;
+        for &e in &cl.edges {
+            let ed = &bd.bld.edges[e as usize];
+            if bd.edge_alive[e as usize] && (in_band(ed.a) || in_band(ed.b)) && (st.pose.rotation * v3(ed.normal)).dot(up).abs() > 0.7 {
+                capacity += ed.strength as f64;
+            }
+        }
+        let e_crush = (capacity * self.cfg.crush_distance as f64) as f32;
+        // velocity before the landing started, and its part into the band
+        let v_pre = cl.v_quiet;
+        let v_in = (-v_pre).dot(up).max(0.0);
+        let m = cl.mass.max(1e-3);
+        // energy balance over the crush distance: ½mv_out² = ½mv_in² + m·g·δ − E_crush (gravity
+        // keeps working on the mass above while the band gives way)
+        let g_down = v3(self.cfg.gravity).dot(-up).max(0.0);
+        let v_out_sq = v_in * v_in + 2.0 * g_down * self.cfg.crush_distance - 2.0 * e_crush / m;
+        if v_out_sq <= 0.0 || crushed.len() == cl.chunks.len() {
+            if debug_impact() {
+                eprintln!(
+                    "no crush t={:.2} chunks={} extent={:.1} v_in={v_in:.2} E={:.3e} J E_crush={e_crush:.3e} J",
+                    self.time,
+                    cl.chunks.len(),
+                    top - base,
+                    0.5 * m * v_in * v_in
+                );
+            }
+            return false;
+        }
+        // the remaining piece goes on through the crushed storey with the energy left over
+        let v_tangent = v_pre + up * v_in;
+        self.phys.set_body_velocity(cl.body, v_tangent - up * v_out_sq.sqrt(), st.angvel);
+        let n_crushed = crushed.len();
+        let every = self.cfg.crush_debris_every;
+        for (i, c) in crushed.into_iter().enumerate() {
+            self.remove_chunk_as(b, c, every > 0 && i % every == 0);
+        }
+        if debug_impact() {
+            eprintln!(
+                "crush t={:.2} chunks={} crushed={n_crushed} extent={:.1} v_in={v_in:.2} E={:.3e} J E_crush={e_crush:.3e} J -> v_out={:.2}",
+                self.time,
+                self.clusters.get(k).map_or(0, |c| c.chunks.len()),
+                top - base,
+                0.5 * m * v_in * v_in,
+                v_out_sq.sqrt()
+            );
+        }
+        true
     }
 
     /// Impact stress (input side): a hard landing decelerates the whole cluster by `dv` within

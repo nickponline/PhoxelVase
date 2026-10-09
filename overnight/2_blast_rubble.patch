@@ -1,0 +1,184 @@
+--- a/rubble/crates/rubble-core/src/config.rs	2026-10-09 00:24:43
++++ b/rubble/crates/rubble-core/src/config.rs	2026-10-09 00:28:24
+@@ -144,6 +144,9 @@
+     /// safety net: frozen chunks re-checked for support per tick (round robin) while anything is
+     /// still moving, 0 = off
+     pub thaw_sweep_per_tick: usize,
++    /// an explosion thaws frozen rubble it pushes by more than this (m/s, impulse / chunk mass)
++    /// back into moving pieces, so blasts scatter rubble piles; 0 = rubble ignores blasts
++    pub blast_thaw_dv: f32,
+     // budgets
+     pub max_dynamic_clusters: usize,
+     pub max_chunks_in_flight: usize,
+@@ -253,6 +256,7 @@
+             thaw_margin: 0.06,
+             thaw_probe: 0.03,
+             thaw_sweep_per_tick: 16,
++            blast_thaw_dv: 0.5,
+             max_dynamic_clusters: 512,
+             max_chunks_in_flight: 50_000,
+             impact_factor: 0.01,
+--- a/rubble/crates/rubble-core/src/world.rs	2026-10-09 00:24:43
++++ b/rubble/crates/rubble-core/src/world.rs	2026-10-09 00:30:22
+@@ -841,6 +841,8 @@
+             let this = &*self;
+             exps.par_iter().map(|e| this.explosion_effects(e)).collect()
+         };
++        // pushes on frozen rubble: (building, chunk, impulse, point)
++        let mut rubble: Vec<(u32, u32, Vec3, Vec3)> = vec![];
+         for f in fx {
+             self.damage.extend(f.damage);
+             self.edge_damage.extend(f.edge_damage);
+@@ -860,12 +862,42 @@
+                         bd.pending_impulse[cu] = a3(p);
+                         bd.pending_impulse_t[cu] = self.time;
+                     }
++                    ChunkState::Frozen => rubble.push((b, c, j, com)),
+                     _ => {}
+                 }
+             }
+         }
++        self.blast_rubble(rubble);
+     }
+ 
++    /// Frozen rubble is static, so a blast would only damage it. Every frozen group with a chunk
++    /// pushed harder than `blast_thaw_dv` thaws back into a moving piece (as when its support
++    /// goes), starting with the velocity all its pushes give it; it settles and freezes again later.
++    fn blast_rubble(&mut self, pushes: Vec<(u32, u32, Vec3, Vec3)>) {
++        let min_dv = self.cfg.blast_thaw_dv;
++        if min_dv <= 0.0 || pushes.is_empty() {
++            return;
++        }
++        for &(b, c, j, _) in &pushes {
++            let bd = &self.buildings[b as usize];
++            if bd.state[c as usize] != ChunkState::Frozen || j.length() < min_dv * bd.bld.chunks[c as usize].mass {
++                continue;
++            }
++            let group = self.frozen_group(b, c);
++            let bd = &self.buildings[b as usize];
++            let pose = bd.chunk_pose[c as usize];
++            let mass: f32 = group.iter().map(|&g| bd.bld.chunks[g as usize].mass).sum();
++            let debris = mass < self.cfg.freeze_min_mass;
++            // all pushes on the group, including weaker ones on its other chunks
++            let members: std::collections::HashSet<u32> = group.iter().copied().collect();
++            let on_group: Vec<(Vec3, Vec3)> =
++                pushes.iter().filter(|p| p.0 == b && members.contains(&p.1)).map(|p| (p.2, p.3)).collect();
++            let (linvel, angvel) = self.velocity_from_impulses(b, &group, pose, &on_group);
++            let k = self.create_cluster(b, group, pose, linvel, angvel, debris);
++            self.emit_detached(k);
++        }
++    }
++
+     fn explosion_effects(&self, e: &Explosion) -> ExplosionFx {
+         let mut fx = ExplosionFx::default();
+         let center = v3(e.center);
+@@ -1517,24 +1549,32 @@
+         }
+         // initial velocity from recent explosion impulses
+         let pose = bd.pose;
+-        let mp = self.mass_props(b, &keep);
++        let pushes: Vec<(Vec3, Vec3)> = keep
++            .iter()
++            .filter(|&&c| self.time - bd.pending_impulse_t[c as usize] <= self.cfg.impulse_memory)
++            .map(|&c| (v3(bd.pending_impulse[c as usize]), pose.transform_point(v3(bd.bld.chunks[c as usize].com))))
++            .collect();
++        let (linvel, angvel) = self.velocity_from_impulses(b, &keep, pose, &pushes);
++        let k = self.create_cluster(b, keep, pose, linvel, angvel, false);
++        self.emit_detached(k);
++    }
++
++    /// Velocity (linear, angular) a rigid piece of `chunks` at `pose` starts with after the
++    /// impulses `pushes` (impulse, world point). A body created this tick has no mass yet, so
++    /// impulses must become its initial velocity rather than be applied to it.
++    fn velocity_from_impulses(&self, b: u32, chunks: &[u32], pose: Pose, pushes: &[(Vec3, Vec3)]) -> (Vec3, Vec3) {
++        let mp = self.mass_props(b, chunks);
+         let com_w = pose.transform_point(mp.local_com);
+         let (mut jl, mut ja) = (Vec3::ZERO, Vec3::ZERO);
+-        for &c in &keep {
+-            let cu = c as usize;
+-            if self.time - bd.pending_impulse_t[cu] <= self.cfg.impulse_memory {
+-                let j = v3(bd.pending_impulse[cu]);
+-                let p = pose.transform_point(v3(bd.bld.chunks[cu].com));
+-                jl += j;
+-                ja += (p - com_w).cross(j);
+-            }
++        for &(j, p) in pushes {
++            jl += j;
++            ja += (p - com_w).cross(j);
+         }
+         let linvel = jl / mp.mass.max(1e-3);
+         let r = Mat3::from_quat(pose.rotation);
+         let iw = r * mp.inertia * r.transpose();
+         let angvel = if iw.determinant().abs() > 1e-9 { iw.inverse() * ja } else { Vec3::ZERO };
+-        let k = self.create_cluster(b, keep, pose, linvel, angvel, false);
+-        self.emit_detached(k);
++        (linvel, angvel)
+     }
+ 
+     fn shatter_static(&mut self, b: u32, c: u32) {
+--- a/rubble/crates/rubble-core/tests/blast_rubble.rs	1969-12-31 16:00:00
++++ b/rubble/crates/rubble-core/tests/blast_rubble.rs	2026-10-09 00:27:50
+@@ -0,0 +1,63 @@
++//! Explosions push settled rubble.
++//!
++//! Rubble that has come to rest is frozen into static colliders. A blast next to it must thaw
++//! the pieces it pushes hard enough back into moving bodies instead of only damaging them, so a
++//! grenade in a rubble pile scatters it. Distant, weak pushes leave the pile frozen.
++use rubble_core::testutil::*;
++use rubble_core::*;
++
++const DT: f32 = 1.0 / 60.0;
++
++/// A loose 0.8 m concrete block lying on the ground (not anchored: frozen rubble once loaded),
++/// and a one-chunk anchored post far away so the building has a root.
++fn rubble_block() -> (World, BuildingId, u32) {
++    let mut s = SynthBuilder::new("rubble_block");
++    s.add([20.0, 20.0, 0.0], [20.5, 20.5, 1.0], 0, 0);
++    let block = s.add([0.0, 0.0, 0.001], [0.8, 0.8, 0.801], 0, 0);
++    let mut w = World::new(WorldConfig::default());
++    let b = w.load_building_bld(s.build(), Isometry::identity());
++    w.add_ground_plane(0.0);
++    for _ in 0..30 {
++        w.step(DT);
++    }
++    (w, b, block)
++}
++
++fn blast(w: &mut World, center: [f32; 3], impulse: f32) {
++    // tiny damage: the block must survive, only the push matters
++    w.explode(Explosion { center, radius: 4.0, inner_radius: 1.0, damage: 1.0, impulse });
++}
++
++fn run(w: &mut World, secs: f32) {
++    for _ in 0..(secs / DT) as usize {
++        w.step(DT);
++        w.drain_events();
++    }
++}
++
++#[test]
++fn blast_scatters_frozen_rubble() {
++    let (mut w, b, block) = rubble_block();
++    assert_eq!(w.building(b).state[block as usize], ChunkState::Frozen, "the loose block starts as frozen rubble");
++    let before = w.chunk_world_com(b.0 as usize, block as usize);
++    blast(&mut w, [-1.5, 0.4, 0.4], 6000.0);
++    run(&mut w, 0.5);
++    let after = w.chunk_world_com(b.0 as usize, block as usize);
++    let moved = (after - before).length();
++    assert!(moved > 0.5, "the blast should throw the block, it moved {moved:.2} m");
++    assert!(after.x > before.x, "away from the blast: {before:?} -> {after:?}");
++    // it settles and freezes again
++    run(&mut w, 8.0);
++    assert_eq!(w.building(b).state[block as usize], ChunkState::Frozen, "settles back into rubble");
++}
++
++#[test]
++fn weak_distant_blast_leaves_rubble_frozen() {
++    let (mut w, b, block) = rubble_block();
++    let before = w.chunk_world_com(b.0 as usize, block as usize);
++    // edge of the blast radius, small impulse: well under the thaw threshold
++    blast(&mut w, [-3.5, 0.4, 0.4], 50.0);
++    run(&mut w, 0.5);
++    assert_eq!(w.building(b).state[block as usize], ChunkState::Frozen);
++    assert!((w.chunk_world_com(b.0 as usize, block as usize) - before).length() < 1e-4);
++}

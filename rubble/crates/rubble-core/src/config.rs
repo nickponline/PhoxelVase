@@ -144,6 +144,9 @@ pub struct WorldConfig {
     /// safety net: frozen chunks re-checked for support per tick (round robin) while anything is
     /// still moving, 0 = off
     pub thaw_sweep_per_tick: usize,
+    /// an explosion thaws frozen rubble it pushes by more than this (m/s, impulse / chunk mass)
+    /// back into moving pieces, so blasts scatter rubble piles; 0 = rubble ignores blasts
+    pub blast_thaw_dv: f32,
     // budgets
     pub max_dynamic_clusters: usize,
     pub max_chunks_in_flight: usize,
@@ -173,6 +176,21 @@ pub struct WorldConfig {
     /// solver tolerance / iterations per call for impact solves
     pub impact_tol: f32,
     pub impact_iters: usize,
+    /// Progressive collapse ("crush front"): a falling piece taller than `crush_min_extent` (m,
+    /// along the impact) that lands with more kinetic energy than it takes to crush the
+    /// `crush_band` (m, about a storey) at its base crushes that band; the rest keeps falling
+    /// with the energy left over, lands on the next storey and so on, so a tall section
+    /// pancakes itself floor by floor instead of landing rigid. The crush energy of the band is
+    /// the capacity (N) of its load-bearing bonds (normal within ~45° of the impact) times
+    /// `crush_distance` (m): the resisting force drops sharply once columns buckle, so the work
+    /// to crush a storey is about its peak capacity over ~1/7 of the storey height (0.5 m for
+    /// 3.6 m). Gravity's work over that distance counts on the falling side. `crush_band` 0 = off.
+    pub crush_band: f32,
+    pub crush_min_extent: f32,
+    pub crush_distance: f32,
+    /// of the crushed chunks, every n-th stays as debris (the rest is pulverized); 0 = none.
+    /// Solid debris under the front would cushion and hold up the falling section.
+    pub crush_debris_every: usize,
     /// contact impulse (N·s) below which impacts do not damage static chunks
     pub impact_min_impulse: f32,
     /// hp damage per N·s above `impact_min_impulse`
@@ -197,8 +215,17 @@ pub struct WorldConfig {
     /// per material id: penetration resistance (energy per meter)
     pub material_resistance: Vec<f32>,
     pub emit_edge_events: bool,
-    /// rapier continuous collision detection (off: debris faster than ~18 m/s may tunnel thin slabs)
+    /// full (swept) continuous collision detection for every moving body, whatever its speed.
+    /// Expensive: rapier's CCD pass costs about as much as the rest of a collapse tick.
     pub ccd: bool,
+    /// predictive ("soft") collision detection for pieces faster than this (m/s), looking one
+    /// step's travel ahead, switched per body every tick; 0 = off. Without it a piece moving
+    /// more than a slab's thickness per tick (0.2 m slab at 60 Hz: ~12 m/s, a ~7 m fall) can
+    /// pass through it.
+    pub ccd_speed: f32,
+    /// ... for pieces of at most this many chunks. Small debris is what visibly tunnels; a big
+    /// falling section is far thicker than any slab it lands on.
+    pub ccd_max_chunks: usize,
     pub solver_iterations: usize,
     /// Worker threads for the rigid-body step (a process-wide pool per size). Rapier's results do
     /// not depend on the thread count; a few threads beat the whole machine for this workload
@@ -244,6 +271,7 @@ impl Default for WorldConfig {
             thaw_margin: 0.06,
             thaw_probe: 0.03,
             thaw_sweep_per_tick: 16,
+            blast_thaw_dv: 0.5,
             max_dynamic_clusters: 512,
             max_chunks_in_flight: 50_000,
             impact_factor: 0.01,
@@ -258,6 +286,10 @@ impl Default for WorldConfig {
             impact_support_band: 1.0,
             impact_rounds: 3,
             impact_latency_ticks: 6,
+            crush_band: 3.6,
+            crush_min_extent: 8.0,
+            crush_distance: 0.5,
+            crush_debris_every: 10,
             impact_tol: 1e-3,
             impact_iters: 200,
             impact_min_impulse: 3000.0,
@@ -276,6 +308,8 @@ impl Default for WorldConfig {
             material_resistance: vec![400.0, 300.0, 100.0, 1500.0, 1.0],
             emit_edge_events: false,
             ccd: false,
+            ccd_speed: 9.0,
+            ccd_max_chunks: 16,
             solver_iterations: 4,
             physics_threads: 0,
             stress: StressSettings::default(),

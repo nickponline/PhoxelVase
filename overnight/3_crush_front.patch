@@ -1,0 +1,331 @@
+--- a/rubble/crates/rubble-core/src/config.rs	2026-10-09 00:28:24
++++ b/rubble/crates/rubble-core/src/config.rs	2026-10-09 00:41:14
+@@ -176,6 +176,21 @@
+     /// solver tolerance / iterations per call for impact solves
+     pub impact_tol: f32,
+     pub impact_iters: usize,
++    /// Progressive collapse ("crush front"): a falling piece taller than `crush_min_extent` (m,
++    /// along the impact) that lands with more kinetic energy than it takes to crush the
++    /// `crush_band` (m, about a storey) at its base crushes that band; the rest keeps falling
++    /// with the energy left over, lands on the next storey and so on, so a tall section
++    /// pancakes itself floor by floor instead of landing rigid. The crush energy of the band is
++    /// the capacity (N) of its load-bearing bonds (normal within ~45° of the impact) times
++    /// `crush_distance` (m): the resisting force drops sharply once columns buckle, so the work
++    /// to crush a storey is about its peak capacity over ~1/7 of the storey height (0.5 m for
++    /// 3.6 m). Gravity's work over that distance counts on the falling side. `crush_band` 0 = off.
++    pub crush_band: f32,
++    pub crush_min_extent: f32,
++    pub crush_distance: f32,
++    /// of the crushed chunks, every n-th stays as debris (the rest is pulverized); 0 = none.
++    /// Solid debris under the front would cushion and hold up the falling section.
++    pub crush_debris_every: usize,
+     /// contact impulse (N·s) below which impacts do not damage static chunks
+     pub impact_min_impulse: f32,
+     /// hp damage per N·s above `impact_min_impulse`
+@@ -271,6 +286,10 @@
+             impact_support_band: 1.0,
+             impact_rounds: 3,
+             impact_latency_ticks: 6,
++            crush_band: 3.6,
++            crush_min_extent: 8.0,
++            crush_distance: 0.5,
++            crush_debris_every: 10,
+             impact_tol: 1e-3,
+             impact_iters: 200,
+             impact_min_impulse: 3000.0,
+--- a/rubble/crates/rubble-core/src/world.rs	2026-10-09 00:30:22
++++ b/rubble/crates/rubble-core/src/world.rs	2026-10-09 01:04:33
+@@ -109,6 +109,9 @@
+     pub connected: bool,
+     /// predictive collision detection is on for its body (see `WorldConfig::ccd_speed`)
+     pub ccd: bool,
++    /// velocity at the last tick with no landing under way (`impact_dv` near zero): what it
++    /// hit with, unaffected by the contact solver's push-out impulses during the landing
++    pub v_quiet: Vec3,
+ }
+ 
+ struct ImpactResult {
+@@ -575,6 +578,7 @@
+         // 7. physics (first wake / thaw anything whose support was removed this tick)
+         self.thaw_unsupported();
+         self.update_ccd(dt);
++        self.record_quiet_velocities();
+         self.phys.step(dt);
+         self.timings.physics_ms = lap(&mut t);
+         // 8. impacts
+@@ -589,6 +593,17 @@
+         self.timings.total_ms = t_start.elapsed().as_secs_f32() * 1e3;
+     }
+ 
++    /// Before the physics step: a cluster with no landing under way remembers its velocity, so a
++    /// landing (which may happen within this one step) is judged by how fast it hit, not by the
++    /// contact solver's push-out impulses while it settles (see `crush_front`).
++    fn record_quiet_velocities(&mut self) {
++        for (_, cl) in self.clusters.iter_mut() {
++            if cl.impact_dv.length_squared() < 0.25 {
++                cl.v_quiet = self.phys.body_state(cl.body).linvel;
++            }
++        }
++    }
++
+     /// Anti-tunneling only where it is needed. Small pieces (`ccd_max_chunks`) faster than
+     /// `ccd_speed` get predictive contacts one step's travel ahead (plus a margin), so fast
+     /// debris stops on thin slabs instead of passing through; the slow majority and big
+@@ -1090,6 +1105,11 @@
+     /// Chunk HP reached zero: remove it from the static set / its cluster, then either
+     /// spawn small dynamic debris or shatter it.
+     fn remove_chunk(&mut self, b: u32, c: u32) {
++        self.remove_chunk_as(b, c, true);
++    }
++
++    /// `remove_chunk`; with `allow_debris` false it always shatters (pulverized).
++    fn remove_chunk_as(&mut self, b: u32, c: u32, allow_debris: bool) {
+         let cu = c as usize;
+         let min_vol = self.debris_min_volume();
+         let (keep, max_clusters) = (self.cfg.keep_debris, self.max_clusters());
+@@ -1136,7 +1156,8 @@
+         let ch = bd.bld.chunks[cu];
+         // debris that is destroyed again shatters (no debris-of-debris)
+         let was_debris = matches!(st, ChunkState::InCluster(k) if self.clusters.get(k).map_or(false, |c| c.debris));
+-        let can_debris = !was_debris
++        let can_debris = allow_debris
++            && !was_debris
+             && !bd.glass(cu)
+             && ch.flags & F_NO_DEBRIS == 0
+             && ch.volume >= min_vol
+@@ -1639,6 +1660,7 @@
+             broken: vec![],
+             connected: false,
+             ccd: false,
++            v_quiet: linvel,
+         });
+         for &c in &chunks {
+             let cu = c as usize;
+@@ -1992,6 +2014,9 @@
+             let t = self.time;
+             for (k, sup, dv) in impact_jobs {
+                 self.clusters[k].last_impact = t;
++                if self.crush_front(k, &sup, dv) {
++                    continue;
++                }
+                 let job = self.impact_job(k, &sup, dv);
+                 let (tx, rx) = std::sync::mpsc::channel();
+                 if self.cfg.impact_latency_ticks == 0 {
+@@ -2055,6 +2080,80 @@
+         if debug_impact() && t0.elapsed().as_secs_f32() > 1e-3 {
+             eprintln!("rebuild clusters {:.2} ms ({} clusters)", t0.elapsed().as_secs_f32() * 1e3, self.clusters.len());
+         }
++    }
++
++    /// Progressive collapse (see `WorldConfig::crush_band`). A tall cluster that has just landed
++    /// with velocity change `dvv` (pointing away from what it hit) on `supports`: if its kinetic
++    /// energy before the landing exceeds the crush energy of the band at its base, the band is
++    /// crushed (pulverized now, a few pieces kept as debris) and the cluster is sent on with the velocity the remaining
++    /// energy allows, so it drops onto the next storey and the front moves up through it.
++    /// Returns false (nothing done) when it is too short or the band can take the hit.
++    fn crush_front(&mut self, k: ClusterKey, supports: &[u32], dvv: Vec3) -> bool {
++        let (band, min_extent) = (self.cfg.crush_band, self.cfg.crush_min_extent);
++        if band <= 0.0 || supports.is_empty() {
++            return false;
++        }
++        let Some(cl) = self.clusters.get(k) else { return false };
++        let b = cl.building;
++        let bd = &self.buildings[b as usize];
++        let st = self.phys.body_state(cl.body);
++        let up = dvv.try_normalize().unwrap_or(Vec3::Z);
++        let h = |c: u32| st.pose.transform_point(v3(bd.bld.chunks[c as usize].com)).dot(up);
++        let base = supports.iter().map(|&c| h(c)).fold(f32::INFINITY, f32::min);
++        let top = cl.chunks.iter().map(|&c| h(c)).fold(f32::NEG_INFINITY, f32::max);
++        if top - base < min_extent {
++            return false;
++        }
++        let in_band = |c: u32| h(c) <= base + band;
++        let crushed: Vec<u32> = cl.chunks.iter().copied().filter(|&c| in_band(c)).collect();
++        // load-bearing bonds of the band: along the impact, touching a band chunk
++        let mut capacity = 0.0f64;
++        for &e in &cl.edges {
++            let ed = &bd.bld.edges[e as usize];
++            if bd.edge_alive[e as usize] && (in_band(ed.a) || in_band(ed.b)) && (st.pose.rotation * v3(ed.normal)).dot(up).abs() > 0.7 {
++                capacity += ed.strength as f64;
++            }
++        }
++        let e_crush = (capacity * self.cfg.crush_distance as f64) as f32;
++        // velocity before the landing started, and its part into the band
++        let v_pre = cl.v_quiet;
++        let v_in = (-v_pre).dot(up).max(0.0);
++        let m = cl.mass.max(1e-3);
++        // energy balance over the crush distance: ½mv_out² = ½mv_in² + m·g·δ − E_crush (gravity
++        // keeps working on the mass above while the band gives way)
++        let g_down = v3(self.cfg.gravity).dot(-up).max(0.0);
++        let v_out_sq = v_in * v_in + 2.0 * g_down * self.cfg.crush_distance - 2.0 * e_crush / m;
++        if v_out_sq <= 0.0 || crushed.len() == cl.chunks.len() {
++            if debug_impact() {
++                eprintln!(
++                    "no crush t={:.2} chunks={} extent={:.1} v_in={v_in:.2} E={:.3e} J E_crush={e_crush:.3e} J",
++                    self.time,
++                    cl.chunks.len(),
++                    top - base,
++                    0.5 * m * v_in * v_in
++                );
++            }
++            return false;
++        }
++        // the remaining piece goes on through the crushed storey with the energy left over
++        let v_tangent = v_pre + up * v_in;
++        self.phys.set_body_velocity(cl.body, v_tangent - up * v_out_sq.sqrt(), st.angvel);
++        let n_crushed = crushed.len();
++        let every = self.cfg.crush_debris_every;
++        for (i, c) in crushed.into_iter().enumerate() {
++            self.remove_chunk_as(b, c, every > 0 && i % every == 0);
++        }
++        if debug_impact() {
++            eprintln!(
++                "crush t={:.2} chunks={} crushed={n_crushed} extent={:.1} v_in={v_in:.2} E={:.3e} J E_crush={e_crush:.3e} J -> v_out={:.2}",
++                self.time,
++                self.clusters.get(k).map_or(0, |c| c.chunks.len()),
++                top - base,
++                0.5 * m * v_in * v_in,
++                v_out_sq.sqrt()
++            );
++        }
++        true
+     }
+ 
+     /// Impact stress (input side): a hard landing decelerates the whole cluster by `dv` within
+--- a/rubble/crates/rubble-core/tests/crush_front.rs	1969-12-31 16:00:00
++++ b/rubble/crates/rubble-core/tests/crush_front.rs	2026-10-09 01:03:52
+@@ -0,0 +1,134 @@
++//! Progressive collapse ("crush front", `WorldConfig::crush_band`).
++//!
++//! A tall section that falls a storey carries far more energy than the storey below it can
++//! absorb, so it must crush its way down floor by floor (the old model let a tall section land
++//! rigid and stand on the stubs: building4's top 47 floors did). Checked here on a stiff
++//! 30-storey synthetic tube: the front runs all the way down, it never adds energy (nothing
++//! falls faster than free fall), an energy gate stops it when a storey can take the hit, and a
++//! short section is not affected at all.
++use rubble_core::testutil::*;
++use rubble_core::*;
++
++const DT: f32 = 1.0 / 60.0;
++const STOREY: f32 = 3.3;
++
++/// A stiff tube tower: `floors` storeys of 3.3 m, 6 x 6 m, four 0.3 m perimeter walls in 1.5 m
++/// panels per storey and a 0.3 m slab on top of each.
++fn tube_tower(floors: usize) -> rubble_format::Bld {
++    let mut s = SynthBuilder::new("tube_tower");
++    let (side, t, storey, slab) = (6.0f32, 0.3f32, 3.0f32, 0.3f32);
++    s.add_grid([0.0, 0.0, 0.0], [side, side, slab], [4, 4, 1], 0, rubble_format::F_INDESTRUCTIBLE);
++    for f in 0..floors {
++        let z0 = slab + f as f32 * (storey + slab);
++        let z1 = z0 + storey;
++        s.add_grid([0.0, 0.0, z0], [side, t, z1], [4, 1, 2], 0, 0);
++        s.add_grid([0.0, side - t, z0], [side, side, z1], [4, 1, 2], 0, 0);
++        s.add_grid([0.0, t, z0], [t, side - t, z1], [1, 4, 2], 0, 0);
++        s.add_grid([side - t, t, z0], [side, side - t, z1], [1, 4, 2], 0, 0);
++        s.add_grid([0.0, 0.0, z1], [side, side, z1 + slab], [4, 4, 1], 0, 0);
++    }
++    s.build()
++}
++
++fn run(w: &mut World, secs: f32) {
++    for _ in 0..(secs / DT) as usize {
++        w.step(DT);
++        w.drain_events();
++    }
++}
++
++/// Destroy every chunk with its centre between `z0` and `z1`; returns the chunks above `z1`.
++fn cut(w: &mut World, b: BuildingId, z0: f32, z1: f32) -> Vec<usize> {
++    let n = w.building(b).n_chunks();
++    let mut above = vec![];
++    for c in 0..n {
++        let z = w.chunk_world_com(b.0 as usize, c).z;
++        if z > z0 && z < z1 {
++            w.damage_chunk(b, c as u32, 1e9);
++        } else if z >= z1 {
++            above.push(c);
++        }
++    }
++    above
++}
++
++/// (chunks of `above` that were crushed (gone), highest remaining one's centre z)
++fn outcome(w: &World, b: BuildingId, above: &[usize]) -> (usize, f32) {
++    let bd = w.building(b);
++    let gone = above.iter().filter(|&&c| bd.state[c] == ChunkState::Gone).count();
++    let top = above
++        .iter()
++        .filter(|&&c| bd.state[c] != ChunkState::Gone)
++        .map(|&c| w.chunk_world_com(b.0 as usize, c).z)
++        .fold(0.0f32, f32::max);
++    (gone, top)
++}
++
++/// The 30-storey tube with the walls of storey `cut` destroyed.
++fn cut_tube(cfg: WorldConfig, cut_storey: usize) -> (World, BuildingId, Vec<usize>) {
++    let mut w = World::new(cfg);
++    let b = w.load_building_bld(tube_tower(30), Isometry::identity());
++    w.add_ground_plane(0.0);
++    w.step(DT);
++    let z0 = 0.3 + cut_storey as f32 * STOREY;
++    let above = cut(&mut w, b, z0, z0 + 3.0);
++    (w, b, above)
++}
++
++#[test]
++fn tall_section_crushes_down_without_gaining_energy() {
++    let (mut w, b, above) = cut_tube(WorldConfig::default(), 2);
++    // the roof: the highest chunk; it rides on top of the front all the way down
++    let roof = *above.iter().max_by(|&&a, &&c| w.chunk_world_com(0, a).z.total_cmp(&w.chunk_world_com(0, c).z)).unwrap();
++    let z_start = w.chunk_world_com(0, roof).z;
++    let mut z_prev = z_start;
++    for i in 1..=(8.0 / DT) as usize {
++        w.step(DT);
++        w.drain_events();
++        if w.building(b).state[roof] == ChunkState::Gone {
++            break;
++        }
++        let z = w.chunk_world_com(0, roof).z;
++        // energy: never faster than free fall since the cut (plus a step of slack)
++        let t = i as f32 * DT;
++        let v = (z_prev - z) / DT;
++        assert!(v <= 9.81 * t + 1.0, "roof falling at {v:.1} m/s after {t:.2} s: faster than free fall");
++        z_prev = z;
++    }
++    let (gone, top) = outcome(&w, b, &above);
++    assert!(gone > above.len() * 3 / 4, "the front should run through the tower: {gone} of {} crushed", above.len());
++    assert!(top < 15.0, "the tower should have come down, highest piece at {top:.1} m (roof was {z_start:.1} m)");
++}
++
++#[test]
++fn crush_needs_the_energy() {
++    // a storey that takes far more energy to crush than the falling section has stops the front
++    // at once: the outcome is exactly that of the old model
++    let after = |cfg: WorldConfig| {
++        let (mut w, b, above) = cut_tube(cfg, 2);
++        run(&mut w, 8.0);
++        outcome(&w, b, &above)
++    };
++    let gated = after(WorldConfig { crush_distance: 1000.0, ..Default::default() });
++    let off = after(WorldConfig { crush_band: 0.0, ..Default::default() });
++    assert_eq!(gated, off, "(crushed, highest) with an impossible crush energy vs without the crush front");
++}
++
++#[test]
++fn short_section_is_not_crushed() {
++    // synthetic 20-storey tower, columns of storey 18 destroyed: the ~6 m left above is shorter
++    // than `crush_min_extent`, so the outcome is exactly the old one
++    let run_cut = |cfg: WorldConfig| {
++        let mut w = World::new(cfg);
++        let b = w.load_building_bld(tower(20, 9.0, true), Isometry::identity());
++        w.add_ground_plane(0.0);
++        w.step(DT);
++        let z0 = 0.3 + 18.0 * STOREY;
++        let above = cut(&mut w, b, z0, z0 + 3.0);
++        run(&mut w, 6.0);
++        outcome(&w, b, &above)
++    };
++    let new = run_cut(WorldConfig::default());
++    let old = run_cut(WorldConfig { crush_band: 0.0, ..Default::default() });
++    assert_eq!(new, old, "(crushed, highest) with and without the crush front");
++}
