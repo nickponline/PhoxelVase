@@ -1,0 +1,173 @@
+diff --git a/rubble/crates/rubble-core/src/config.rs b/rubble/crates/rubble-core/src/config.rs
+index 72ec73e..b41334c 100644
+--- a/rubble/crates/rubble-core/src/config.rs
++++ b/rubble/crates/rubble-core/src/config.rs
+@@ -210,6 +210,10 @@ pub struct WorldConfig {
+     /// edge damage = explosion damage * falloff * this
+     pub explosion_edge_damage_scale: f32,
+     pub crack_radius_factor: f32,
++    /// Blast waves break glass far beyond the structural damage: a pane up to this many blast
++    /// radii away shatters if nothing solid (non-glass) stands between it and the blast.
++    /// 0 = glass only breaks inside the blast radius like anything else.
++    pub glass_blast_range: f32,
+     // explosions
+     pub occlusion_factor: f32,
+     pub occlusion_max_hits: usize,
+@@ -310,6 +314,7 @@ impl Default for WorldConfig {
+             edge_health_per_newton: 1e-3,
+             explosion_edge_damage_scale: 1.0,
+             crack_radius_factor: 1.5,
++            glass_blast_range: 3.0,
+             occlusion_factor: 0.5,
+             occlusion_max_hits: 3,
+             occlusion_max_chunks: 256,
+diff --git a/rubble/crates/rubble-core/src/world.rs b/rubble/crates/rubble-core/src/world.rs
+index 9808db2..69e841f 100644
+--- a/rubble/crates/rubble-core/src/world.rs
++++ b/rubble/crates/rubble-core/src/world.rs
+@@ -150,6 +150,9 @@ fn debug_impact() -> bool {
+ 
+ /// Workers for background impact solves (persistent: no thread spawn per job). A dedicated
+ /// pool keeps them off the global rayon pool, which the physics step uses.
++/// Most panes a single blast wave tests for line of sight (nearest first).
++const GLASS_BLAST_MAX_PANES: usize = 512;
++
+ fn impact_pool() -> &'static rayon::ThreadPool {
+     static POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
+     POOL.get_or_init(|| rayon::ThreadPoolBuilder::new().num_threads(4).thread_name(|i| format!("rubble-impact-{i}")).build().unwrap())
+@@ -1016,6 +1019,56 @@ impl World {
+                 fx.impulses.push((b, c, dir * (e.impulse * f / wsum), com));
+             }
+         }
++        // the blast wave blows out windows well beyond the damage radius, where nothing solid
++        // shields them
++        let reach = r * self.cfg.glass_blast_range;
++        if reach > r {
++            qbuf.clear();
++            self.phys.query_aabb(center - Vec3::splat(reach), center + Vec3::splat(reach), &mut qbuf);
++            let mut panes: Vec<(f32, u32, u32, Pose)> = vec![];
++            for &(_, tag) in &qbuf {
++                if tag_kind(tag) != KIND_CHUNK {
++                    continue;
++                }
++                let (b, c) = tag_chunk(tag);
++                let bd = &self.buildings[b as usize];
++                if !bd.glass(c as usize) || !bd.alive(c as usize) {
++                    continue;
++                }
++                let pose = self.chunk_world_pose(b as usize, c as usize);
++                let d = bd.shapes[c as usize].distance_to_point(&pose, center, true);
++                if d > r && d <= reach {
++                    panes.push((d, b, c, pose));
++                }
++            }
++            // nearest first, a bounded number of line-of-sight rays per blast
++            panes.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
++            for &(_, b, c, pose) in panes.iter().take(GLASS_BLAST_MAX_PANES) {
++                // aim at the pane's middle: a ray to its nearest point grazes the window reveal
++                let target = pose.transform_point(v3(self.buildings[b as usize].bld.chunks[c as usize].com));
++                let dv = target - center;
++                let dist = dv.length();
++                if dist <= 1e-3 {
++                    continue;
++                }
++                hits.clear();
++                self.phys.ray_all(center, dv / dist, dist - 1e-2, 16, &mut hits);
++                let blocked = hits.iter().any(|h| {
++                    h.toi < dist - 1e-2
++                        && match tag_kind(h.tag) {
++                            KIND_CHUNK => {
++                                let (hb, hc) = tag_chunk(h.tag);
++                                !self.buildings[hb as usize].glass(hc as usize)
++                            }
++                            KIND_CLUSTER => true,
++                            _ => false,
++                        }
++                });
++                if !blocked {
++                    fx.damage.push((b, c, f32::MAX));
++                }
++            }
++        }
+         // edge damage out to crack radius
+         let mut edges: Vec<(u32, u32)> = vec![];
+         for &(b, c, _, _) in &cand {
+diff --git a/rubble/crates/rubble-core/tests/glass_blast.rs b/rubble/crates/rubble-core/tests/glass_blast.rs
+new file mode 100644
+index 0000000..b351ada
+--- /dev/null
++++ b/rubble/crates/rubble-core/tests/glass_blast.rs
+@@ -0,0 +1,73 @@
++//! Blast waves blow out windows well beyond the blast radius (`WorldConfig::glass_blast_range`),
++//! but not windows shielded by something solid.
++use rubble_core::testutil::*;
++use rubble_core::*;
++
++const DT: f32 = 1.0 / 60.0;
++const GLASS: u16 = 4;
++
++/// Blast of radius 2 m at the origin. Panes (1 x 0.02 x 1 m on short anchored posts): one in the
++/// open 4 m away, one 4 m away behind a concrete wall, one in the open 8 m away (beyond 3 radii).
++/// Returns which of (open, shielded, far) shattered.
++fn blast(cfg: WorldConfig) -> (bool, bool, bool) {
++    let mut s = SynthBuilder::new("panes");
++    let pane = |s: &mut SynthBuilder, x: f32, y: f32| {
++        s.add([x, y, 0.0], [x + 1.0, y + 0.2, 1.0], 0, 0); // post
++        s.add([x, y + 0.09, 1.0], [x + 1.0, y + 0.11, 2.0], GLASS, 0)
++    };
++    let open = pane(&mut s, -0.5, 4.0);
++    let shielded = pane(&mut s, -0.5, -4.2);
++    let far = pane(&mut s, 7.5, 0.0);
++    // concrete wall between the blast and the shielded pane
++    s.add([-3.0, -2.5, 0.0], [3.0, -2.2, 4.0], 0, 0);
++    let mut w = World::new(cfg);
++    let b = w.load_building_bld(s.build(), Isometry::identity());
++    w.add_ground_plane(0.0);
++    w.step(DT);
++    w.explode(Explosion { center: [0.0, 0.0, 1.5], radius: 2.0, inner_radius: 0.5, damage: 50.0, impulse: 0.0 });
++    for _ in 0..3 {
++        w.step(DT);
++    }
++    let gone = |c: u32| w.building(b).state[c as usize] == ChunkState::Gone;
++    (gone(open), gone(shielded), gone(far))
++}
++
++#[test]
++fn blast_wave_breaks_exposed_windows_only() {
++    let (open, shielded, far) = blast(WorldConfig::default());
++    assert!(open, "a pane in the open at 2 blast radii shatters");
++    assert!(!shielded, "a pane behind a concrete wall survives");
++    assert!(!far, "a pane beyond 3 blast radii survives");
++}
++
++#[test]
++fn without_blast_wave_only_the_radius_counts() {
++    let (open, _, _) = blast(WorldConfig { glass_blast_range: 0.0, ..Default::default() });
++    assert!(!open, "(control) without the blast wave the pane at 2 radii survives");
++}
++
++#[test]
++fn office_facade_windows_blow_out() {
++    // a G-sized blast (6 m) in front of office_1: count panes that shatter, with and without
++    let p = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../assets/buildings/office_1/building.bld");
++    if !std::path::Path::new(p).exists() {
++        return;
++    }
++    let count = |cfg: WorldConfig| {
++        let mut w = World::new(cfg);
++        w.load_building(p, Isometry::identity()).unwrap();
++        w.add_ground_plane(0.0);
++        w.step(DT);
++        w.explode(Explosion { center: [12.0, -3.0, 4.0], radius: 6.0, inner_radius: 2.5, damage: 5000.0, impulse: 30000.0 });
++        let mut n = 0;
++        for _ in 0..10 {
++            w.step(DT);
++            n += w.drain_events().iter().filter(|e| matches!(e, Event::ChunkShattered { building, chunk, .. } if w.building(*building).glass(*chunk as usize))).count();
++        }
++        n
++    };
++    let with = count(WorldConfig::default());
++    let without = count(WorldConfig { glass_blast_range: 0.0, ..Default::default() });
++    eprintln!("office: {with} panes shattered with the blast wave, {without} without");
++    assert!(with >= 2 * without.max(1), "the blast wave should blow out many more windows: {with} vs {without}");
++}

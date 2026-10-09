@@ -139,8 +139,12 @@ pub fn setup_effects(
     mut meshes: ResMut<Assets<Mesh>>,
     mut mats: ResMut<Assets<StandardMaterial>>,
     mut images: ResMut<Assets<Image>>,
+    mut media: ResMut<Assets<bevy::light::atmosphere::ScatteringMedium>>,
     spec: Res<WorldSpec>,
 ) {
+    // the planet for the lighting mode's sky (its centre 6360 km below the ground; only cameras
+    // with `AtmosphereSettings` draw it)
+    commands.spawn(bevy::light::Atmosphere::earth(media.add(bevy::light::atmosphere::ScatteringMedium::earth(256, 256))));
     // glow colours are set for the current lighting by `apply_lighting`
     let spark = mats.add(StandardMaterial { base_color: spark_color(false), unlit: true, ..default() });
     let bits = [[0.62, 0.61, 0.58], [0.6, 0.3, 0.22], [0.55, 0.4, 0.25], [0.45, 0.48, 0.52], [0.7, 0.85, 0.95]]
@@ -184,12 +188,13 @@ pub fn setup_effects(
     ));
 }
 
-/// The fog volume (a unit cube) stretched over the loaded buildings plus some margin.
+/// The fog volume (a unit cube) over the loaded buildings: wide enough that its sides never
+/// show against the sky, as tall as the buildings plus some margin.
 fn fog_transform(spec: &WorldSpec) -> Transform {
     let (lo, hi) = spec.bounds();
-    let pad = 30.0;
-    let c = [(lo[0] + hi[0]) * 0.5, (lo[1] + hi[1]) * 0.5, (lo[2] + hi[2]) * 0.5 + pad * 0.25];
-    let s = [hi[0] - lo[0] + 2.0 * pad, hi[1] - lo[1] + 2.0 * pad, hi[2] - lo[2] + pad];
+    let (pad, pad_up) = (400.0, 30.0);
+    let c = [(lo[0] + hi[0]) * 0.5, (lo[1] + hi[1]) * 0.5, (lo[2] + hi[2]) * 0.5 + pad_up * 0.25];
+    let s = [hi[0] - lo[0] + 2.0 * pad, hi[1] - lo[1] + 2.0 * pad, hi[2] - lo[2] + pad_up];
     Transform::from_translation(to_bevy(c)).with_scale(Vec3::new(s[0], s[2], s[1]))
 }
 
@@ -306,15 +311,19 @@ pub fn apply_lighting(
                 ScreenSpaceAmbientOcclusion { quality_level: ScreenSpaceAmbientOcclusionQualityLevel::Medium, ..default() },
                 ContactShadows { length: 0.5, ..default() },
                 VolumetricFog { ambient_intensity: 0.0, step_count: 32, jitter: 0.5, ..default() },
+                // a physically based sky lit by the same sun (replaces the flat clear colour)
+                bevy::pbr::AtmosphereSettings::default(),
             ));
         } else {
-            e.remove::<(Bloom, TemporalAntiAliasing, ScreenSpaceAmbientOcclusion, ContactShadows, VolumetricFog)>();
+            e.remove::<(Bloom, TemporalAntiAliasing, ScreenSpaceAmbientOcclusion, ContactShadows, VolumetricFog, bevy::pbr::AtmosphereSettings)>();
             e.insert(Msaa::default());
             e.remove::<Hdr>();
         }
     }
     for mut f in &mut fogs {
-        f.directional_light_color = if on { Color::srgba(1.0, 0.85, 0.65, 0.35) } else { Color::NONE };
+        // the atmosphere does the distance haze (lit by the same sun) in this mode
+        f.color = if on { Color::NONE } else { Color::srgb(0.62, 0.74, 0.86) };
+        f.directional_light_color = Color::NONE;
         f.directional_light_exponent = 40.0;
     }
     let (dir, lux, color) = sun(on);

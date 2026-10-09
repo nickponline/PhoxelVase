@@ -150,6 +150,9 @@ fn debug_impact() -> bool {
 
 /// Workers for background impact solves (persistent: no thread spawn per job). A dedicated
 /// pool keeps them off the global rayon pool, which the physics step uses.
+/// Most panes a single blast wave tests for line of sight (nearest first).
+const GLASS_BLAST_MAX_PANES: usize = 512;
+
 fn impact_pool() -> &'static rayon::ThreadPool {
     static POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
     POOL.get_or_init(|| rayon::ThreadPoolBuilder::new().num_threads(4).thread_name(|i| format!("rubble-impact-{i}")).build().unwrap())
@@ -1014,6 +1017,56 @@ impl World {
                 let com = pose.transform_point(v3(self.buildings[b as usize].bld.chunks[c as usize].com));
                 let dir = (com - center).try_normalize().unwrap_or(Vec3::Z);
                 fx.impulses.push((b, c, dir * (e.impulse * f / wsum), com));
+            }
+        }
+        // the blast wave blows out windows well beyond the damage radius, where nothing solid
+        // shields them
+        let reach = r * self.cfg.glass_blast_range;
+        if reach > r {
+            qbuf.clear();
+            self.phys.query_aabb(center - Vec3::splat(reach), center + Vec3::splat(reach), &mut qbuf);
+            let mut panes: Vec<(f32, u32, u32, Pose)> = vec![];
+            for &(_, tag) in &qbuf {
+                if tag_kind(tag) != KIND_CHUNK {
+                    continue;
+                }
+                let (b, c) = tag_chunk(tag);
+                let bd = &self.buildings[b as usize];
+                if !bd.glass(c as usize) || !bd.alive(c as usize) {
+                    continue;
+                }
+                let pose = self.chunk_world_pose(b as usize, c as usize);
+                let d = bd.shapes[c as usize].distance_to_point(&pose, center, true);
+                if d > r && d <= reach {
+                    panes.push((d, b, c, pose));
+                }
+            }
+            // nearest first, a bounded number of line-of-sight rays per blast
+            panes.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
+            for &(_, b, c, pose) in panes.iter().take(GLASS_BLAST_MAX_PANES) {
+                // aim at the pane's middle: a ray to its nearest point grazes the window reveal
+                let target = pose.transform_point(v3(self.buildings[b as usize].bld.chunks[c as usize].com));
+                let dv = target - center;
+                let dist = dv.length();
+                if dist <= 1e-3 {
+                    continue;
+                }
+                hits.clear();
+                self.phys.ray_all(center, dv / dist, dist - 1e-2, 16, &mut hits);
+                let blocked = hits.iter().any(|h| {
+                    h.toi < dist - 1e-2
+                        && match tag_kind(h.tag) {
+                            KIND_CHUNK => {
+                                let (hb, hc) = tag_chunk(h.tag);
+                                !self.buildings[hb as usize].glass(hc as usize)
+                            }
+                            KIND_CLUSTER => true,
+                            _ => false,
+                        }
+                });
+                if !blocked {
+                    fx.damage.push((b, c, f32::MAX));
+                }
             }
         }
         // edge damage out to crack radius

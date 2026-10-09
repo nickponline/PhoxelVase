@@ -210,6 +210,10 @@ pub struct WorldConfig {
     /// edge damage = explosion damage * falloff * this
     pub explosion_edge_damage_scale: f32,
     pub crack_radius_factor: f32,
+    /// Blast waves break glass far beyond the structural damage: a pane up to this many blast
+    /// radii away shatters if nothing solid (non-glass) stands between it and the blast.
+    /// 0 = glass only breaks inside the blast radius like anything else.
+    pub glass_blast_range: f32,
     // explosions
     pub occlusion_factor: f32,
     pub occlusion_max_hits: usize,
@@ -310,6 +314,7 @@ impl Default for WorldConfig {
             edge_health_per_newton: 1e-3,
             explosion_edge_damage_scale: 1.0,
             crack_radius_factor: 1.5,
+            glass_blast_range: 3.0,
             occlusion_factor: 0.5,
             occlusion_max_hits: 3,
             occlusion_max_chunks: 256,

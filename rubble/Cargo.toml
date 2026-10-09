@@ -29,5 +29,9 @@ opt-level = 3
 
 # Vendored parry3d 0.31.1 with performance-only patches (bit-identical results); see
 # PERF.md ("Vendored parry3d").
+# Vendored rapier3d 0.36.0, patched to wait for its deferred broad-phase task without parking
+# a pool worker (fixes a rare hang with several worlds stepping at once); see
+# vendor/rapier3d/RUBBLE_PATCH.md.
 [patch.crates-io]
 parry3d = { path = "vendor/parry3d" }
+rapier3d = { path = "vendor/rapier3d" }

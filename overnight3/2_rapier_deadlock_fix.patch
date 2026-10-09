@@ -1,0 +1,136 @@
+diff --git a/rubble/Cargo.toml b/rubble/Cargo.toml
+index 2c3c867..cb1ee17 100644
+--- a/rubble/Cargo.toml
++++ b/rubble/Cargo.toml
+@@ -29,5 +29,9 @@ opt-level = 3
+ 
+ # Vendored parry3d 0.31.1 with performance-only patches (bit-identical results); see
+ # PERF.md ("Vendored parry3d").
++# Vendored rapier3d 0.36.0, patched to wait for its deferred broad-phase task without parking
++# a pool worker (fixes a rare hang with several worlds stepping at once); see
++# vendor/rapier3d/RUBBLE_PATCH.md.
+ [patch.crates-io]
+ parry3d = { path = "vendor/parry3d" }
++rapier3d = { path = "vendor/rapier3d" }
+diff --git a/rubble/crates/rubble-core/tests/concurrent_worlds.rs b/rubble/crates/rubble-core/tests/concurrent_worlds.rs
+new file mode 100644
+index 0000000..6084024
+--- /dev/null
++++ b/rubble/crates/rubble-core/tests/concurrent_worlds.rs
+@@ -0,0 +1,69 @@
++//! Several worlds stepped at the same time on different threads (a server running matches, a
++//! test runner, an editor with previews) must never deadlock. They share the physics thread
++//! pool; rapier's step parks a pool worker on a channel while its deferred broad-phase task
++//! runs elsewhere in the pool, which used to hang when several steps were inside the pool.
++use rubble_core::testutil::*;
++use rubble_core::*;
++use std::sync::mpsc;
++use std::time::Duration;
++
++const DT: f32 = 1.0 / 60.0;
++
++const OFFICE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../assets/buildings/office_1/building.bld");
++
++/// A collapse that keeps the physics pool busy: office_1 (or a synthetic tower when the asset
++/// is missing) with its ground floor destroyed.
++fn collapse(seed: u32, ticks: usize, physics_threads: usize) -> usize {
++    let mut w = World::new(WorldConfig { physics_threads, ..Default::default() });
++    let b = if std::path::Path::new(OFFICE).exists() {
++        w.load_building(OFFICE, Isometry::identity()).unwrap()
++    } else {
++        w.load_building_bld(tower(10, 9.0, true), Isometry::identity())
++    };
++    w.add_ground_plane(0.0);
++    w.step(DT);
++    let n = w.building(b).n_chunks();
++    for c in 0..n {
++        let z = w.chunk_world_com(0, c).z;
++        if z > 0.4 && z < 3.4 && !(c as u32 + seed).is_multiple_of(7) {
++            w.damage_chunk(b, c as u32, 1e9);
++        }
++    }
++    for _ in 0..ticks {
++        w.step(DT);
++        w.drain_events();
++    }
++    w.stats().gone_chunks
++}
++
++/// `threads` worlds collapsing at once, each on its own thread, sharing a physics pool of
++/// `pool` threads; fails instead of hanging.
++fn concurrent(threads: u32, rounds: u32, pool: usize) {
++    let (tx, rx) = mpsc::channel();
++    for t in 0..threads {
++        let tx = tx.clone();
++        std::thread::spawn(move || {
++            for round in 0..rounds {
++                collapse(t * 10 + round, 300, pool);
++            }
++            let _ = tx.send(t);
++        });
++    }
++    drop(tx);
++    for _ in 0..threads {
++        if let Err(e) = rx.recv_timeout(Duration::from_secs(120)) {
++            panic!("worlds stepping concurrently hung (deadlock): {e:?}");
++        }
++    }
++}
++
++#[test]
++fn many_worlds_on_many_threads() {
++    concurrent(16, 2, 0);
++}
++
++#[test]
++fn many_worlds_on_a_small_pool() {
++    // the smallest pool rapier defers work in (2 threads): the easiest to exhaust
++    concurrent(16, 2, 2);
++}
+--- a/rubble/vendor/rapier3d/src/pipeline/physics_pipeline/mod.rs
++++ b/rubble/vendor/rapier3d/src/pipeline/physics_pipeline/mod.rs
+@@ -136,7 +136,23 @@
+     fn join_deferred_bvh_optimize(&mut self, broad_phase: &mut BroadPhaseBvh) {
+         #[cfg(feature = "parallel")]
+         if let Some(rx) = self.deferred_bvh.get_mut().unwrap().take() {
+-            let task = rx.recv().expect("the deferred BVH optimization task died");
++            // rubble patch: wait the rayon way. A plain `rx.recv()` parks this pool worker
++            // while the task it waits for sits in the same pool; with several worlds stepping
++            // in a shared pool every worker could end up parked (a rare hang). While waiting,
++            // run pending pool work instead, including the task itself.
++            let task = loop {
++                match rx.try_recv() {
++                    Ok(task) => break task,
++                    Err(std::sync::mpsc::TryRecvError::Empty) => {
++                        if rayon::yield_now() != Some(rayon::Yield::Executed) {
++                            std::thread::yield_now();
++                        }
++                    }
++                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
++                        panic!("the deferred BVH optimization task died")
++                    }
++                }
++            };
+             broad_phase.finish_deferred_optimize(task);
+             return;
+         }
+diff --git a/rubble/vendor/rapier3d/RUBBLE_PATCH.md b/rubble/vendor/rapier3d/RUBBLE_PATCH.md
+new file mode 100644
+index 0000000..9014f4b
+--- /dev/null
++++ b/rubble/vendor/rapier3d/RUBBLE_PATCH.md
+@@ -0,0 +1,14 @@
++# Vendored rapier3d 0.36.0
++
++Unmodified crates.io rapier3d 0.36.0 (`src/`, `README.md`, `Cargo.toml` without its example and
++test targets), except for one change:
++
++`src/pipeline/physics_pipeline/mod.rs`, `PhysicsPipeline::join_deferred_bvh_optimize`: the join
++of the deferred broad-phase optimization task waits with `try_recv` + `rayon::yield_now()`
++instead of a blocking `rx.recv()`. The task is `rayon::spawn`ed into the pool the step runs in;
++a blocking `recv` parks that pool worker, and with several worlds stepping in a shared pool
++(rubble's physics pool is shared between worlds) every worker could end up parked or waiting
++on a parked one: a rare deadlock. Waiting the rayon way lets the waiting worker run pending
++pool work, including the task itself. Results are unchanged (same task, same data).
++
++Regression test: `crates/rubble-core/tests/concurrent_worlds.rs`.

@@ -1,0 +1,92 @@
+diff --git a/rubble/crates/rubble-viewer/src/render.rs b/rubble/crates/rubble-viewer/src/render.rs
+index cf4f071..ea384e2 100644
+--- a/rubble/crates/rubble-viewer/src/render.rs
++++ b/rubble/crates/rubble-viewer/src/render.rs
+@@ -51,6 +51,8 @@ pub struct RenderState {
+     pub groups: HashMap<GroupKey, Group>,
+     pub owner: Vec<Vec<Option<GroupKey>>>,
+     pub cached: Vec<Vec<Option<ChunkState>>>,
++    /// per chunk: wear level last drawn (`wear_level`); a change rebuilds its group
++    pub wear: Vec<Vec<u8>>,
+     pub buildings: Vec<BuildingRender>,
+     /// rebuild everything (colors changed / reset)
+     pub all_dirty: bool,
+@@ -115,6 +117,25 @@ fn hsv(h: f32, s: f32, v: f32) -> [f32; 3] {
+     [c.red, c.green, c.blue]
+ }
+ 
++/// Damage steps shown (each one rebuilds the chunk's group once, so they are few).
++const WEAR_STEPS: f32 = 5.0;
++
++/// How worn a chunk looks: its lost hit points in `WEAR_STEPS` steps. Quantized so steady
++/// damage rebuilds meshes only a few times.
++pub fn wear_level(bd: &rubble_core::Building, c: usize) -> u8 {
++    if bd.glass(c) || bd.hp_max[c] <= 0.0 {
++        return 0;
++    }
++    let lost = (1.0 - bd.hp[c] / bd.hp_max[c]).clamp(0.0, 1.0);
++    (lost * WEAR_STEPS).round() as u8
++}
++
++/// Darken a chunk colour for its wear level: up to 45% for a chunk about to break.
++fn worn(s: [f32; 3], wear: u8) -> [f32; 3] {
++    let lost = wear as f32 / WEAR_STEPS;
++    s.map(|v| v * (1.0 - 0.45 * lost))
++}
++
+ /// sRGB color of a chunk's outer faces (vertex color; inner faces are darkened).
+ fn chunk_srgb(b: u32, c: u32, bld: &Bld, random: bool) -> [f32; 3] {
+     let h = hash32(c.wrapping_mul(2654435761) ^ b.wrapping_mul(97));
+@@ -178,7 +199,8 @@ fn hull_mesh(hv: &[[f32; 3]], hp: &[[f32; 4]], verts: &mut Vec<MeshVertex>, idx:
+ }
+ 
+ /// Mesh of `chunks` in building space (Z-up; the entity transform rotates it to Y-up).
+-pub fn build_mesh(b: u32, bld: &Bld, br: &BuildingRender, chunks: &[u32], random_colors: bool) -> Option<Mesh> {
++pub fn build_mesh(b: u32, bd: &rubble_core::Building, br: &BuildingRender, chunks: &[u32], random_colors: bool) -> Option<Mesh> {
++    let bld = &bd.bld;
+     let nv: usize = chunks.iter().map(|&c| br.runs[c as usize].1 as usize).sum();
+     let ni: usize = chunks.iter().map(|&c| br.runs[c as usize].3 as usize).sum();
+     if ni == 0 {
+@@ -194,7 +216,7 @@ pub fn build_mesh(b: u32, bld: &Bld, br: &BuildingRender, chunks: &[u32], random
+             continue;
+         }
+         let base = pos.len() as u32;
+-        let s = chunk_srgb(b, c, bld, random_colors);
++        let s = worn(chunk_srgb(b, c, bld, random_colors), wear_level(bd, c as usize));
+         let outer = Color::srgb(s[0], s[1], s[2]).to_linear().to_f32_array();
+         let inner = Color::srgb(s[0] * 0.62, s[1] * 0.62, s[2] * 0.62).to_linear().to_f32_array();
+         for v in &br.verts[v0 as usize..(v0 + vn) as usize] {
+@@ -232,6 +254,7 @@ impl RenderState {
+         self.buildings = sim.world.buildings.iter().map(|b| BuildingRender::new(&b.bld)).collect();
+         self.owner = sim.world.buildings.iter().map(|b| vec![None; b.n_chunks()]).collect();
+         self.cached = sim.world.buildings.iter().map(|b| vec![None; b.n_chunks()]).collect();
++        self.wear = sim.world.buildings.iter().map(|b| vec![0; b.n_chunks()]).collect();
+         self.all_dirty = true;
+     }
+ }
+@@ -264,7 +287,16 @@ pub fn sync_render(
+         let b = bi as u32;
+         let cached = &mut rs.cached[bi];
+         let owner = &mut rs.owner[bi];
++        let wear = &mut rs.wear[bi];
+         for (ci, st) in bd.state.iter().enumerate() {
++            // damage shows on the chunk: redraw its group when its wear level changes
++            let lv = wear_level(bd, ci);
++            if lv != wear[ci] {
++                wear[ci] = lv;
++                if let Some(g) = owner[ci].and_then(|k| rs.groups.get_mut(&k)) {
++                    g.dirty = true;
++                }
++            }
+             if cached[ci] == Some(*st) {
+                 continue;
+             }
+@@ -316,7 +348,7 @@ pub fn sync_render(
+         }
+         let bd = &w.buildings[g.building as usize];
+         let br = &rs.buildings[g.building as usize];
+-        let Some(mesh) = build_mesh(g.building, &bd.bld, br, &g.chunks, overlays.random_colors) else {
++        let Some(mesh) = build_mesh(g.building, bd, br, &g.chunks, overlays.random_colors) else {
+             if let Some(e) = g.entity.take() {
+                 commands.entity(e).despawn();
+             }
