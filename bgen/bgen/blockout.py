@@ -1,4 +1,4 @@
-"""Blockout: masses -> per-floor footprints, floor levels, facade segments (DESIGN §2.4)."""
+"""Blockout: masses -> per-floor footprints, floor levels, facade segments."""
 from __future__ import annotations
 
 import numpy as np

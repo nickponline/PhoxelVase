@@ -1,4 +1,4 @@
-"""`.bld` binary bundle writer/reader (DESIGN.md §4). Layouts must match rubble-format exactly."""
+"""`.bld` binary bundle writer/reader. Layouts must match rubble-format exactly."""
 from __future__ import annotations
 
 import json

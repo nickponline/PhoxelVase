@@ -1,4 +1,4 @@
-"""Building spec loading, preset defaults and seeded sampling (DESIGN §2.2).
+"""Building spec loading, preset defaults and seeded sampling.
 
 `(spec, seed)` fully determines the output: anything not given comes from the preset, and
 numeric [lo, hi] ranges in `global` and in a procedural `blockout` are sampled from the

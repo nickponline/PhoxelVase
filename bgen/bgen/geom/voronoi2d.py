@@ -1,4 +1,4 @@
-"""Bounded 2D Voronoi via mirrored seeds (DESIGN.md §2.5 step 3)."""
+"""Bounded 2D Voronoi via mirrored seeds."""
 from __future__ import annotations
 
 import numpy as np

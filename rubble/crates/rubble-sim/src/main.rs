@@ -1,4 +1,4 @@
-//! `rubble-sim`: headless scenario runner and benchmark (DESIGN §3.7).
+//! `rubble-sim`: headless scenario runner and benchmark.
 //!
 //!   rubble-sim run scenario.yaml [--out DIR]
 //!   rubble-sim bench [--buildings N] [--no-bending] [--ticks N]

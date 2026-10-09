@@ -1,4 +1,4 @@
-"""End-to-end generation (DESIGN §2.4–2.8).
+"""End-to-end generation.
 
     generate(spec, seed) -> GenResult(ctx, chunks, edges, bd, report, timings)
     build(spec_path, seed, out_root) -> Path   (writes assets/buildings/<name>_<seed>/...)
@@ -230,7 +230,7 @@ def demote_orphan_slivers(chunks: list[ChunkGeom], edges: list[Edge], max_volume
 
 def reinforce_until_stable(bd: BuildingData, max_util: float = 0.5, max_rounds: int = 8,
                            margin: float = 1.25, accept_util: float | None = None) -> dict:
-    """DESIGN §2.7: solve the intact building with rubble's stress solver; while any edge is at or
+    """Solve the intact building with rubble's stress solver; while any edge is at or
     above `max_util`, 'add rebar' by scaling those edges' strength so they would sit at
     max_util/margin, then re-check. Mutates bd.edges['strength'] and records the edit in bd.meta."""
     import tempfile

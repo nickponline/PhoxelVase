@@ -1,7 +1,7 @@
 """Shared helpers for feature nodes: frames, snapping, vertical wall specs, wall chains,
 documented panel operations (cut_opening, remove_panels, split_panel).
 
-Conventions (DESIGN §2.3):
+Conventions:
   * floor_z[k] = top of slab k (floor level of floor k); slab k occupies [floor_z[k]-ts, floor_z[k]].
     floor_z has n_floors+1 entries; the last is the roof level.
   * Walls of floor k occupy z in [floor_z[k], floor_z[k+1]-ts].

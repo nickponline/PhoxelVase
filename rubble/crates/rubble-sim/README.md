@@ -1,6 +1,6 @@
 # rubble-sim
 
-Headless runner for `rubble-core` (DESIGN.md §3.7).
+Headless runner for `rubble-core`.
 
 ```
 cargo run --release -p rubble-sim -- run scenarios/tower_collapse.yaml [--out DIR]

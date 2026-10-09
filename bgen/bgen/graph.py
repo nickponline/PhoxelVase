@@ -1,4 +1,4 @@
-"""Chunk connection graph + anchors (DESIGN.md §2.6).
+"""Chunk connection graph + anchors.
 
 Edges:
   * intra-panel: shared 2D boundaries between chunk polygons of the same panel

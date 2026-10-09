@@ -2,7 +2,7 @@
 name = "rubble-py"
 edition.workspace = true
 version.workspace = true
-description = "Python bindings for rubble (DESIGN.md §3.6)"
+description = "Python bindings for rubble"
 
 [lib]
 name = "rubble"

@@ -1,7 +1,7 @@
 //! Small math helpers (glam types re-exported through rapier/parry).
 pub use rapier3d::math::{Mat3, Pose, Rotation as Quat, Vec3};
 
-/// Rigid placement of a building: translation + yaw about +Z (no scale), DESIGN §1.
+/// Rigid placement of a building: translation + yaw about +Z (no scale).
 #[derive(Clone, Copy, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Isometry {
     pub pos: [f32; 3],

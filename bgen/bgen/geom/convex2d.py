@@ -1,5 +1,5 @@
 """2D convex helpers: convex decomposition (earcut + Hertel–Mehlhorn), polygon cleanup,
-convex hulls and vectorised edge-adjacency between polygon soups (DESIGN.md §2.5/§2.6).
+convex hulls and vectorised edge-adjacency between polygon soups.
 """
 from __future__ import annotations
 

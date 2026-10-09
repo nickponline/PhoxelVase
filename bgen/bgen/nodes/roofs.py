@@ -1,4 +1,4 @@
-"""`roofs` node (DESIGN §2.4).
+"""`roofs` node.
 
 For every level k, the exposed region floor_polys[k-1] - floor_polys[k] gets a roof slab
 (same level/thickness as a floor slab, so it meets floor slab k edge to edge). Then:

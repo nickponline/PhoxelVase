@@ -1,4 +1,4 @@
-"""High-level render entry points (DESIGN.md §2.8, §3.6 render-sim).
+"""High-level render entry points.
 
     render_all(bd, out_dir)                      -> every preview image of a building
     render_frames(bd, transforms, out_dir, ...)  -> destruction sequence frames
@@ -124,7 +124,7 @@ def _radius(mesh: RenderMesh) -> float:
 
 def render_all(bd, out_dir, size=(1280, 960), backend: str = "auto",
                edge_utilization: np.ndarray | None = None, timings: dict | None = None) -> list[Path]:
-    """Render every image of DESIGN §2.8 into `out_dir`; returns the written paths."""
+    """Render every image into `out_dir`; returns the written paths."""
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     mesh = _as_mesh(bd)

@@ -1,4 +1,4 @@
-//! The destruction world and its fixed-step tick pipeline (DESIGN §3.3–3.5).
+//! The destruction world and its fixed-step tick pipeline.
 use crate::building::{Building, ChunkState, ClusterKey};
 use crate::config::*;
 use crate::events::*;

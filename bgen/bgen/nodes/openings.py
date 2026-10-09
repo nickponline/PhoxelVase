@@ -1,4 +1,4 @@
-"""`openings` node: doors + windows cut from wall profiles (DESIGN §2.4).
+"""`openings` node: doors + windows cut from wall profiles.
 
 Doors: per floor a BFS spanning tree over the door-capable links from `rooms` (root: stair
 core rooms, plus the outside on the ground floor), so every room gets >= 1 door and is

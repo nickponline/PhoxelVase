@@ -1,5 +1,5 @@
 """`manifest.json`: spec echo, seed, version, stats, materials, rooms, sockets, timings,
-validation report (DESIGN §2.8)."""
+validation report."""
 from __future__ import annotations
 
 import json

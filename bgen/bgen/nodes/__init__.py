@@ -1,4 +1,4 @@
-"""Feature-node registry (DESIGN §2.4).
+"""Feature-node registry.
 
 Each node module exposes `node(ctx, params, rng) -> ctx` and optionally
 `reserve(ctx, params, rng)`, a pre-pass run for all nodes (in order) before any `node` call,

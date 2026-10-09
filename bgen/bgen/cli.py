@@ -1,4 +1,4 @@
-"""`bgen` command line (DESIGN §2.9).
+"""`bgen` command line.
 
   bgen build specs/office.yaml --seed 1234 --out assets/buildings/
   bgen batch specs/ --seeds 1..20 --jobs 8

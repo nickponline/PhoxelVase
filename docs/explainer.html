@@ -132,7 +132,7 @@ th { color: var(--muted); font-weight: 600; }
 <main>
 <button class="toggle" id="themeToggle" type="button" aria-label="Toggle light or dark theme">Theme</button>
 <header class="hero">
-  <span class="pill">the-finals project · explainer</span>
+  <span class="pill">PhoxelVase project · explainer</span>
   <h1>Destructible buildings, from blueprint to rubble</h1>
   <p class="lead">This page explains the full system, step by step. One program makes buildings that can break. A second program breaks them with bullets and explosions. The text uses simple technical English. Each special term has a definition where it first occurs.</p>
 </header>
@@ -656,7 +656,7 @@ nodes:
 
 <!-- ============================================================ -->
 <h2 id="run">9. How to run it</h2>
-<p>Do these steps from the project folder <code>the-finals/</code>.</p>
+<p>Do these steps from the project's root folder.</p>
 <ol class="steps">
   <li>Make one building:<pre>.venv/bin/bgen build bgen/specs/office.yaml --seed 1 --out assets/buildings</pre></li>
   <li>Look at the images in <code>assets/buildings/office_1/renders/</code>.</li>
@@ -664,7 +664,7 @@ nodes:
   <li>Open the result in <code>runs/office_columns_out/</code>.</li>
   <li>Start the viewer:<pre>cd rubble &amp;&amp; cargo run --release -p rubble-viewer -- ../assets/buildings/office_1/building.bld</pre></li>
 </ol>
-<p>See <code>README.md</code> for set-up, tests and more commands. See <code>DESIGN.md</code> for the full design.</p>
+<p>See <code>README.md</code> for an overview and the test commands.</p>
 
 <!-- ============================================================ -->
 <h2 id="glossary">10. Glossary</h2>

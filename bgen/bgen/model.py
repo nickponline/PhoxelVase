@@ -1,4 +1,4 @@
-"""Core data model shared by all bgen stages (see DESIGN.md §2.3–2.6).
+"""Core data model shared by all bgen stages.
 
 Pipeline:  Spec -> BuildingContext(panels, rooms, sockets) -> [ChunkGeom per panel]
            -> edges -> BuildingData (flat numpy arrays) -> .bld / .glb / renders
@@ -109,7 +109,7 @@ class Edge:
 
 @dataclass
 class BuildingData:
-    """Everything that goes into a .bld file, as flat arrays (§4)."""
+    """Everything that goes into a .bld file, as flat arrays."""
     meta: dict
     elements: np.ndarray              # ELEM_DTYPE
     chunks: np.ndarray                # CHNK_DTYPE

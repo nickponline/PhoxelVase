@@ -1,4 +1,4 @@
-//! Rigid-body backend boundary (DESIGN §3.1). The destruction layer only talks to
+//! Rigid-body backend boundary. The destruction layer only talks to
 //! [`PhysicsBackend`]; [`RapierBackend`] is the current implementation.
 //!
 //! Conventions: every dynamic body's local frame equals the *building frame* of the

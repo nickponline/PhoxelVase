@@ -1,4 +1,4 @@
-"""Per-panel pre-fracture: decompose -> seed -> Voronoi clip -> merge -> extrude (DESIGN.md §2.5).
+"""Per-panel pre-fracture: decompose -> seed -> Voronoi clip -> merge -> extrude.
 
 cfg keys (all optional; defaults derived from the materials table):
   cell_size       target Voronoi cell size in m (default: material.cell_size)

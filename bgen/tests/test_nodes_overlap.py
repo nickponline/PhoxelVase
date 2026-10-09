@@ -1,4 +1,4 @@
-"""No two panels may overlap in volume (DESIGN §2.3 junction rules).
+"""No two panels may overlap in volume.
 
 Each panel profile is convex-decomposed; every convex part extruded by the panel thickness is
 a convex polytope (set of half-spaces). Two polytopes overlap with real volume iff a ball of

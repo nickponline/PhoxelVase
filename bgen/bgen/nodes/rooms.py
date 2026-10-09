@@ -1,4 +1,4 @@
-"""`rooms` node: BSP room partition + interior walls (DESIGN §2.4).
+"""`rooms` node: BSP room partition + interior walls.
 
 Per floor the clear interior (inside exterior walls, minus stair cores incl. their walls) is
 split recursively by axis-aligned walls of thickness `int_wall_thickness`. Each wall is cut

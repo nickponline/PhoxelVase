@@ -1,6 +1,6 @@
 //! Engine (Z-up) <-> Bevy (Y-up) conversion. **This is the only place axes are swapped.**
 //!
-//! The engine is right-handed Z-up (DESIGN §1); Bevy is right-handed Y-up. The mapping is a
+//! The engine is right-handed Z-up; Bevy is right-handed Y-up. The mapping is a
 //! proper rotation of -90° about X:  `(x, y, z)_engine  ->  (x, z, -y)_bevy`.
 //!
 //! Render meshes stay in engine *building space* (Z-up); an entity's Bevy `Transform` is

@@ -1,4 +1,4 @@
-"""Hand-built golden fixtures for the .bld contract (DESIGN.md §6 M0)."""
+"""Hand-built golden fixtures for the .bld contract."""
 from __future__ import annotations
 
 import numpy as np

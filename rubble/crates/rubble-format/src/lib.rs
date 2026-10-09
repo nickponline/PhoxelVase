@@ -1,4 +1,4 @@
-//! `.bld` building bundle: the contract between `bgen` (Python) and `rubble` (DESIGN.md §4).
+//! `.bld` building bundle: the contract between `bgen` (Python) and `rubble`.
 //! Record layouts are `#[repr(C)]` and must match `bgen/bgen/export/bld.py` dtypes byte-for-byte.
 
 use bytemuck::{Pod, Zeroable};

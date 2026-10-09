@@ -1,4 +1,4 @@
-//! Per-building immutable data + SoA mutable state + CSR graph (DESIGN §3.3).
+//! Per-building immutable data + SoA mutable state + CSR graph.
 use crate::math::{Pose, Vec3};
 use crate::physics::{ColliderId, CompoundParts, PhysicsBackend, RapierBackend, Shape};
 use rayon::prelude::*;
@@ -261,7 +261,7 @@ impl Building {
         self.stress_active = true;
     }
 
-    /// Incremental connectivity (DESIGN §3.4): BFS from dirty nodes over alive edges between
+    /// Incremental connectivity: BFS from dirty nodes over alive edges between
     /// `Static` chunks, early-out on anchors, epoch-stamped visits. Non-structural chunks
     /// (glass, cosmetic) never bridge structural components; they detach with their neighbours.
     pub fn find_detached(&mut self) -> Vec<Vec<u32>> {

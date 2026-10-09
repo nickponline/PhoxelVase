@@ -1,4 +1,4 @@
-//! `rubble-viewer`: interactive Bevy viewer for `rubble-core` (DESIGN §3.2).
+//! `rubble-viewer`: interactive Bevy viewer for `rubble-core`.
 //!
 //!   cargo run -p rubble-viewer --release -- [FILE.bld ...] [--scenario S.yaml] [--arena N]
 //!   cargo run -p rubble-viewer --release -- fixtures/two_box.bld --screenshot out.png --frames 120 \

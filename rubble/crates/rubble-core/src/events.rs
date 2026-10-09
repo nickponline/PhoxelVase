@@ -1,4 +1,4 @@
-//! Engine events (DESIGN §3.5).
+//! Engine events.
 use serde::Serialize;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, serde::Deserialize)]

@@ -1,4 +1,4 @@
-"""Connection graph (DESIGN §2.6) on a mini box room built with the §2.3 junction rules."""
+"""Connection graph on a mini box room built with the junction rules."""
 import time
 
 import numpy as np
@@ -23,7 +23,7 @@ def frame(ex, ey, origin):
 
 def box_room(W=6.0, D=4.0, H=3.3, slab=0.3, wall=0.2, z0=0.0, pid0=0, glass=True, door=True):
     """Floor + ceiling slabs spanning the full footprint, 4 walls between them; X walls run
-    through the corners, Y walls butt into them (§2.3). South wall has a window with a glass
+    through the corners, Y walls butt into them. South wall has a window with a glass
     pane, east wall a door."""
     ch = H - 2 * slab
     P = []

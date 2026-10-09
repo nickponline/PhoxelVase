@@ -1,4 +1,4 @@
-"""validate() (DESIGN §2.7 geometry/graph checks) on the box room and on broken inputs."""
+"""validate() on the box room and on broken inputs."""
 import copy
 
 import numpy as np

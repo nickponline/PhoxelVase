@@ -1,5 +1,5 @@
 """`building.glb` preview export via trimesh: one node per chunk with
-extras {chunk_id, panel_id, material, flags} (DESIGN §2.8)."""
+extras {chunk_id, panel_id, material, flags}."""
 from __future__ import annotations
 
 import json

@@ -1,5 +1,5 @@
 //! Intact synthetic structures must stand under the full stress model (bending on):
-//! max utilization < 0.5 (DESIGN §2.7). Graph built exactly like `Building::new`.
+//! max utilization < 0.5. Graph built exactly like `Building::new`.
 use rubble_core::rubble_format::{Bld, F_COSMETIC_ATTACHED, F_GLASS};
 use rubble_core::testutil::*;
 use rubble_stress::{static_report, StressConfig, StressInput, StaticReport};
@@ -202,7 +202,7 @@ fn real_buildings() -> Vec<(String, Bld)> {
 /// Presets whose intact structure is over-stressed in this model for a structural reason
 /// (not a solver artifact): tower ribbon glazing leaves 0.5 m plain-concrete spandrel bands
 /// spanning 3–3.5 m windows under the floor line load; warehouse_2's 9 m flat roof slab.
-/// They stand (< 3) but miss the 0.5 margin until bgen reinforces them (§2.7).
+/// They stand (< 3) but miss the 0.5 margin until bgen reinforces them.
 const KNOWN_OVER: [&str; 2] = ["tower_", "warehouse_2"];
 
 #[test]

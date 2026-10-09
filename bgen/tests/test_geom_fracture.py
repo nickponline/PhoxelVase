@@ -1,4 +1,4 @@
-"""fracture_panel (DESIGN §2.5): conservation, convexity, flags, determinism, performance."""
+"""fracture_panel: conservation, convexity, flags, determinism, performance."""
 import time
 
 import numpy as np

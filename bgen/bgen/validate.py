@@ -1,4 +1,4 @@
-"""Build validation (DESIGN.md §2.7), geometry + graph part.
+"""Build validation, geometry + graph part.
 
 Implemented here: hull convexity, mesh watertightness / winding / positive volume, per-panel
 volume conservation, chunk interpenetration (SAT), anchor connectivity, aspect-ratio
@@ -247,7 +247,7 @@ def check_aspect(chunks: list[ChunkGeom], rep: ValidationReport) -> None:
 
 def validate(panels: list[Panel], chunks: list[ChunkGeom], edges: list[Edge],
              mesh_check: str = "fast") -> ValidationReport:
-    """Run the §2.7 geometry/graph checks. `mesh_check` = "fast" (vectorised weld + directed
+    """Run the geometry/graph checks. `mesh_check` = "fast" (vectorised weld + directed
     edge pairing, same criteria as trimesh) or "trimesh" (per-chunk trimesh, slower)."""
     rep = ValidationReport()
     rep.stats.update(n_panels=len(panels), n_chunks=len(chunks), n_edges=len(edges),

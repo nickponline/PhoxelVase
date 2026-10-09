@@ -1,5 +1,5 @@
 #![allow(clippy::needless_range_loop, clippy::manual_memcpy)]
-//! # rubble-stress — structural stress solver (DESIGN §3.4)
+//! # rubble-stress — structural stress solver
 //!
 //! ## Model
 //! The building's connection graph is treated as a **resistive (electrical) network**:
@@ -102,7 +102,7 @@
 //!   the region's boundary ring held at its current potentials (Dirichlet), then any ring node
 //!   whose residual exceeds the threshold becomes dirty for the next tick. This is a moving-window
 //!   Schwarz iteration: a removal is resolved locally at once and its far-field effect diffuses
-//!   out over subsequent ticks (the "creak delay" of DESIGN §3.4). Window seeds are the
+//!   out over subsequent ticks (the "creak delay"). Window seeds are the
 //!   worst-residual dirty nodes; while work remains the window grows ×1.5 per tick (up to
 //!   `max_region_growth × region_max_nodes`), and after 8 stalled ticks at that size the solver
 //!   escalates to global steps, so `converged` is guaranteed to become true eventually.

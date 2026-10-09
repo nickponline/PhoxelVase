@@ -1,4 +1,4 @@
-"""Deterministic RNG streams (DESIGN.md §2.4).
+"""Deterministic RNG streams.
 
 Every consumer gets its own stream derived from a stable hash of (seed, keys...), so editing
 one feature node's parameters never reshuffles the random draws of any other node, and

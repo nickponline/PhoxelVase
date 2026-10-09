@@ -1,4 +1,4 @@
-"""`stairs` node: switchback stair cores (DESIGN §2.4).
+"""`stairs` node: switchback stair cores.
 
 reserve(): picks core rectangles that are identical on every floor they serve (stored in
 ctx.meta['stair_cores']), so columns/rooms can keep out of them.

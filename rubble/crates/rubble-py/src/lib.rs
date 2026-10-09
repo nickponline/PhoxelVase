@@ -1,4 +1,4 @@
-//! `rubble` Python module (DESIGN.md §3.6): pyo3 bindings over `rubble-core` / `rubble-stress`.
+//! `rubble` Python module: pyo3 bindings over `rubble-core` / `rubble-stress`.
 //!
 //! ```python
 //! import rubble
@@ -63,7 +63,7 @@ fn stress_cfg(bending: bool, bend_scale: f32) -> StressConfig {
     StressConfig { bending, bend_scale, ..StressConfig::default() }
 }
 
-/// Offline static analysis of an undamaged building (bgen validation, DESIGN §2.7).
+/// Offline static analysis of an undamaged building (bgen validation).
 ///
 /// Returns dict(max_util, worst_edges=[(edge, util, a, b)], unsupported_nodes, converged, iters,
 /// total_load, anchor_flow, utilization=ndarray f32 (E,)). Loads are m·g of structural chunks

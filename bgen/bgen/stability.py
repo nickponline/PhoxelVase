@@ -1,4 +1,4 @@
-"""Static stability check through rubble's stress solver (DESIGN.md §2.7, §3.6).
+"""Static stability check through rubble's stress solver.
 
     check_stability("assets/buildings/x/building.bld", max_util=0.5)
       -> {'skipped': False, 'ok': True, 'max_util': 0.12, 'worst_edges': [...], ...}

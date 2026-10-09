@@ -1,5 +1,5 @@
 //! What to load: CLI args, `.bld` files, synthetic arenas, scenario yaml (same schema as
-//! `rubble-sim`, DESIGN §3.7; `record` is ignored). Builds fresh `World`s for start/reset.
+//! `rubble-sim`; `record` is ignored). Builds fresh `World`s for start/reset.
 use bevy::prelude::Resource;
 use rubble_core::testutil;
 use rubble_core::{Explosion, Isometry, Projectile, Weapon, World, WorldConfig};

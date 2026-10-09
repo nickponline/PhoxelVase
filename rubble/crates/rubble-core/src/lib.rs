@@ -1,4 +1,4 @@
-//! `rubble-core`: single-player destruction physics engine (DESIGN §3).
+//! `rubble-core`: single-player destruction physics engine.
 //!
 //! Layers: [`building`] (SoA chunk state, CSR graph, incremental connectivity),
 //! [`world`] (tick pipeline, damage, promotion, clusters, settling, budgets),

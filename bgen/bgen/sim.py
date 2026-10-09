@@ -1,4 +1,4 @@
-"""Scripted destruction runs + renders through rubble-py (DESIGN.md §3.6 render-sim, §3.7).
+"""Scripted destruction runs + renders through rubble-py.
 
     from bgen.sim import run_scenario
     res = run_scenario("scenarios/two_box_drop.yaml", "runs/two_box_drop")
