@@ -1,0 +1,16 @@
+# Wrought-iron lattice tower (Eiffel-like, ~1:3 scale): four truss legs on masonry piers merge
+# at the second platform into a tapering shaft; decorative arches under the first platform.
+name: eiffel
+preset: structure
+seed: 1
+nodes:
+  - sculpt:
+      template: eiffel
+      layer: 0.5
+      height: [88.0, 104.0]
+      spread: [0.95, 1.08]
+      ground: {pad: 4.0}
+fracture:
+  metal: {cell_size: 1.4}
+# Slender members sit near the 0.5 target in the coarser variants: accept up to 0.8.
+stability: {accept_util: 0.8, max_rounds: 12}

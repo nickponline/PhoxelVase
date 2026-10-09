@@ -1,0 +1,55 @@
+# GENERATED variant of ../building4.yaml: fracture cell_size x1.6 (coarse: fewer, larger chunks).
+# Same layout as the base spec for a given seed; only the fracture differs.
+name: building4_coarse
+preset: tower
+seed: 4
+global: {floor_height: 3.6, slab_thickness: 0.3, ext_wall_thickness: 0.35, column_material: metal}
+blockout:
+- footprint:
+  - [0, 0]
+  - [40, 0]
+  - [40, 32]
+  - [0, 32]
+  floors: 4
+- footprint:
+  - [7, 3]
+  - [33, 3]
+  - [33, 29]
+  - [7, 29]
+  floors: 40
+- footprint:
+  - [10, 6]
+  - [30, 6]
+  - [30, 26]
+  - [10, 26]
+  floors: 48
+- footprint:
+  - [14, 10]
+  - [26, 10]
+  - [26, 22]
+  - [14, 22]
+  floors: 52
+nodes:
+- floors: {}
+- exterior_walls:
+    bay_width: [3.0, 3.6]
+- columns: {grid: 6.0, size: 0.8}
+- rooms:
+    min_room: 14.0
+    max_room: [40.0, 60.0]
+- stairs: {cores: 1, type: switchback}
+- openings:
+    windows: {style: ribbon, sill: 0.8, head: 3.0}
+    ground: {style: storefront}
+- roofs:
+    flat: {parapet: 1.2}
+- manual: {}
+fracture:
+  concrete: {cell_size: 3.2}
+  brick: {cell_size: 2.4}
+  wood:
+    cell_size: 1.12
+    anisotropy: [3, 1]
+  metal: {cell_size: 2.88}
+  glass: {mode: shatter_on_hit}
+stability: {accept_util: 0.8, max_rounds: 16}

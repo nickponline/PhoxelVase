@@ -31,4 +31,4 @@ fracture:
   metal: {cell_size: 1.8}
 # At this height interior walls pick up load from the facade at every T-junction; the intact
 # reinforced building still sits at utilization ~0.75: reinforce toward 0.5 but accept < 0.8.
-stability: {accept_util: 0.8}
+stability: {accept_util: 0.8, max_rounds: 16}

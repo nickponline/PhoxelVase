@@ -1,0 +1,43 @@
+# GENERATED variant of ../office.yaml: fracture cell_size x1.6 (coarse: fewer, larger chunks).
+# Same layout as the base spec for a given seed; only the fracture differs.
+name: office_coarse
+preset: office
+seed: 1234
+global:
+  floor_height: [3.4, 3.8]
+  slab_thickness: 0.3
+  ext_wall_thickness: 0.3
+  int_wall_thickness: 0.15
+blockout:
+  shape: [rect, L, annex]
+  width: [24, 36]
+  depth: [14, 18]
+  floors: [4, 6]
+nodes:
+- floors: {}
+- exterior_walls:
+    bay_width: [3.0, 4.5]
+    corner_rule: x_runs_through
+- columns: {grid: 6.0, size: 0.5}
+- rooms:
+    strategy: bsp
+    min_room: 9.0
+    corridor: true
+    tags: {office: 0.6, meeting: 0.25, toilet: 0.15}
+- stairs: {cores: 1, type: switchback}
+- openings:
+    windows: {style: ribbon, sill: 0.9, head: 2.6}
+    ground: {style: storefront}
+    doors: {per_room: 1}
+- roofs:
+    flat: {parapet: 1.0}
+- manual: {file: ../office.overrides.yaml}
+fracture:
+  concrete: {cell_size: 2.08, edge_bias: 1.5}
+  brick: {cell_size: 1.6}
+  wood:
+    cell_size: 1.12
+    anisotropy: [3, 1]
+  metal: {cell_size: 1.92}
+  glass: {mode: shatter_on_hit}
+indestructible: [ground_slab]

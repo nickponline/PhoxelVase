@@ -1,0 +1,19 @@
+# GENERATED variant of ../warehouse.yaml: fracture cell_size x1.6 (coarse: fewer, larger chunks).
+# Same layout as the base spec for a given seed; only the fracture differs.
+name: warehouse_coarse
+preset: warehouse
+seed: 3
+blockout:
+  shape: rect
+  width: [30, 44]
+  depth: [20, 26]
+  floors: 1
+  roof: [flat, gable]
+fracture:
+  concrete: {cell_size: 2.4}
+  brick: {cell_size: 1.28}
+  wood:
+    cell_size: 1.12
+    anisotropy: [3, 1]
+  metal: {cell_size: 2.56}
+  glass: {mode: shatter_on_hit}

@@ -1,0 +1,19 @@
+# GENERATED variant of ../house.yaml: fracture cell_size x1.6 (coarse: fewer, larger chunks).
+# Same layout as the base spec for a given seed; only the fracture differs.
+name: house_coarse
+preset: house
+seed: 5
+blockout:
+  shape: rect
+  width: [9, 12]
+  depth: [7.5, 9]
+  floors: 2
+  roof: [gable, hip]
+fracture:
+  concrete: {cell_size: 1.76, edge_bias: 1.5}
+  brick: {cell_size: 1.28}
+  wood:
+    cell_size: 1.12
+    anisotropy: [3, 1]
+  metal: {cell_size: 1.92}
+  glass: {mode: shatter_on_hit}

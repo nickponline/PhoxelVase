@@ -98,6 +98,21 @@ fn bullet_destroys_one_chunk_no_detach() {
 }
 
 #[test]
+fn beam_radius_widens_the_cut() {
+    // a beam through (5.1, *, 3.1) on a wall of 0.5 m cells: the ray is inside one cell, a 0.3 m
+    // radius also reaches the cells left of x=5.0 and below z=3.0 (and the corner at 0.14 m)
+    for (radius, expect) in [(0.0, 1), (0.3, 4)] {
+        let mut w = World::new(cfg());
+        w.load_building_bld(wall(10.0, 6.0, 0.3, 0.5), Isometry::identity());
+        w.add_ground_plane(0.0);
+        w.step(DT);
+        w.beam([5.1, -20.0, 3.1], [0.0, 1.0, 0.0], 100.0, radius, 1e9, 0.0);
+        let ev = run(&mut w, 2);
+        assert_eq!(count(&ev, |e| matches!(e, Event::ChunkDestroyed { .. })), expect, "radius {radius}: {ev:?}");
+    }
+}
+
+#[test]
 fn ar_bullets_chip_but_dont_destroy_quickly() {
     let mut w = World::new(cfg());
     let b = w.load_building_bld(wall(10.0, 6.0, 0.3, 0.5), Isometry::identity());

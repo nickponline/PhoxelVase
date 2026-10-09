@@ -14,6 +14,9 @@ mod coords;
 mod overlay;
 mod render;
 mod scene;
+mod beam;
+mod demolish;
+mod shards;
 
 use bevy::light::CascadeShadowConfigBuilder;
 use bevy::prelude::*;
@@ -23,12 +26,17 @@ use camera::{camera_control, CamCtl};
 use coords::{to_bevy, to_engine};
 use render::{Materials, RenderState};
 use rubble_core::physics::PhysicsBackend;
-use rubble_core::{BuildingId, Explosion, Projectile, StepTimings, Weapon, World as EngineWorld};
+use rubble_core::{BuildingId, Explosion, StepTimings, World as EngineWorld};
 use scene::{Args, Catalog, Scheduled, WorldSpec};
 
 pub const DT: f32 = 1.0 / 60.0;
-/// damage of E / launcher explosions (radius is adjustable with [ ])
-pub const EXPLOSION_DAMAGE: f32 = 1500.0;
+/// LMB (hold): a cutting beam. Damage per tick to every chunk within `BEAM_RADIUS` of the line
+/// (×material multiplier), range, and push per tick on loose pieces it touches.
+pub const BEAM_DAMAGE: f32 = 400.0;
+pub const BEAM_RANGE: f32 = 400.0;
+/// cutting radius (m); also the radius of the drawn glow
+pub const BEAM_RADIUS: f32 = 0.25;
+pub const BEAM_IMPULSE: f32 = 60.0;
 
 #[derive(Resource)]
 pub struct Sim {
@@ -40,6 +48,30 @@ pub struct Sim {
     pub event_log: std::collections::VecDeque<(f64, usize)>,
     pub tick_ms_avg: f32,
     pub timings_avg: StepTimings,
+    /// (building, chunk) of glass panes broken since the shard system last ran
+    pub shattered: Vec<(u32, u32)>,
+    /// building-space centre of each building (shards burst away from it)
+    pub centres: Vec<Vec3>,
+    /// engine z of the ground plane
+    pub ground: Option<f32>,
+    /// beam held this frame: engine (origin, direction)
+    pub beam: Option<([f32; 3], [f32; 3])>,
+    /// timed actions (engine time, action), e.g. demolition charges
+    pub queued: Vec<(f32, Scheduled)>,
+    /// (building, engine time): demolished buildings collapse without the warning delay until then
+    pub hurry: Vec<(u32, f32)>,
+}
+
+fn run_action(w: &mut EngineWorld, a: &Scheduled) {
+    match a {
+        Scheduled::Explode(e) => w.explode(*e),
+        Scheduled::Fire(p) => w.fire(*p),
+        Scheduled::Damage(b, cs, amt) => {
+            for &c in cs {
+                w.damage_chunk(BuildingId(*b), c, *amt);
+            }
+        }
+    }
 }
 
 impl Sim {
@@ -52,27 +84,59 @@ impl Sim {
             event_log: Default::default(),
             tick_ms_avg: 0.0,
             timings_avg: StepTimings::default(),
+            shattered: vec![],
+            centres: vec![],
+            ground: spec.ground,
+            beam: None,
+            queued: vec![],
+            hurry: vec![],
         }
+        .with_centres()
+    }
+
+    fn with_centres(mut self) -> Self {
+        self.centres = self
+            .world
+            .buildings
+            .iter()
+            .map(|b| {
+                let n = b.bld.chunks.len().max(1) as f32;
+                b.bld.chunks.iter().fold(Vec3::ZERO, |a, c| a + Vec3::from_array(c.com)) / n
+            })
+            .collect();
+        self
     }
 
     fn step(&mut self, spec: &WorldSpec, now: f64) {
+        let now_t = self.world.time + 1e-6;
         while let Some((t, a)) = spec.actions.get(self.next_action) {
-            if *t > self.world.time + 1e-6 {
+            if *t > now_t {
                 break;
             }
-            match a {
-                Scheduled::Explode(e) => self.world.explode(*e),
-                Scheduled::Fire(p) => self.world.fire(*p),
-                Scheduled::Damage(b, cs, amt) => {
-                    for &c in cs {
-                        self.world.damage_chunk(BuildingId(*b), c, *amt);
-                    }
-                }
-            }
+            run_action(&mut self.world, a);
             self.next_action += 1;
         }
+        for (_, a) in self.queued.extract_if(.., |(t, _)| *t <= now_t) {
+            run_action(&mut self.world, &a);
+        }
+        if let Some((o, d)) = self.beam {
+            self.world.beam(o, d, BEAM_RANGE, BEAM_RADIUS, BEAM_DAMAGE, BEAM_IMPULSE);
+        }
         self.world.step(DT);
-        let n = self.world.drain_events().len();
+        let t = self.world.time;
+        self.hurry.retain(|&(_, until)| t <= until);
+        for &(b, _) in &self.hurry {
+            self.world.hurry_collapse(BuildingId(b));
+        }
+        let events = self.world.drain_events();
+        let n = events.len();
+        for e in events {
+            if let rubble_core::Event::ChunkShattered { building, chunk, .. } = e {
+                if self.world.buildings[building.0 as usize].glass(chunk as usize) {
+                    self.shattered.push((building.0, chunk));
+                }
+            }
+        }
         self.event_log.push_back((now, n));
         while self.event_log.front().is_some_and(|(t, _)| now - t > 1.0) {
             self.event_log.pop_front();
@@ -102,31 +166,20 @@ pub struct Overlays {
     pub sleep_tint: bool,
     pub stats: bool,
     pub help: bool,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum WeaponSel {
-    Ar,
-    Sniper,
-    Launcher,
-}
-
-#[derive(Resource)]
-pub struct Controls {
-    pub weapon: WeaponSel,
-    pub radius: f32,
-    pub fire_cooldown: f32,
+    /// engine `keep_debris` (applied to every world, so it survives reset and building switches)
+    pub keep_debris: bool,
 }
 
 /// Engine-space hit under the cursor this frame (Bevy-space point for the camera).
 #[derive(Resource, Default)]
 pub struct CursorHit(pub Option<Vec3>);
 
-/// Short-lived visual feedback (tracers, explosion spheres), Bevy space.
+/// Short-lived visual feedback (explosion spheres, the beam), Bevy space.
 #[derive(Resource, Default)]
 pub struct Fx {
-    pub tracers: Vec<(Vec3, Vec3, f32, Color)>,
     pub blasts: Vec<(Vec3, f32, f32)>,
+    /// beam drawn this frame (Bevy space start, end)
+    pub beam: Option<(Vec3, Vec3)>,
 }
 
 #[derive(Resource)]
@@ -135,11 +188,18 @@ struct Shot {
     frames: u32,
     explode: Option<[f32; 5]>,
     explode_frame: u32,
+    beam: Option<[f32; 6]>,
     frame: u32,
     started: std::time::Instant,
     sim_ms: f64,
     requested: bool,
     target: Option<Handle<Image>>,
+    /// record mode: save a frame every this many ticks into `path` (a directory)
+    record_every: Option<u32>,
+    demolish_frame: Option<u32>,
+    warmup: f32,
+    /// frames rendered since the last capture was requested (record mode exits after a few)
+    done_frames: u32,
 }
 
 fn main() {
@@ -172,7 +232,7 @@ fn main() {
             catalog.select_path(one);
         }
     }
-    let mut overlays = Overlays { help: true, ..default() };
+    let mut overlays = Overlays { help: true, keep_debris: sim.world.cfg.keep_debris, ..default() };
     for o in &args.overlays {
         match o.as_str() {
             "f1" | "graph" => overlays.graph = true,
@@ -180,6 +240,7 @@ fn main() {
             "f3" | "colors" => overlays.random_colors = true,
             "f4" | "sleep" => overlays.sleep_tint = true,
             "f5" | "stats" => overlays.stats = true,
+            "f6" | "debris" => overlays.keep_debris = true,
             "nohelp" => overlays.help = false,
             _ => eprintln!("unknown overlay {o}"),
         }
@@ -199,7 +260,6 @@ fn main() {
     .insert_resource(Time::<Fixed>::from_hz(60.0))
     .insert_resource(GlobalAmbientLight { color: Color::srgb(0.85, 0.9, 1.0), brightness: 250.0, ..default() })
     .insert_resource(overlays)
-    .insert_resource(Controls { weapon: WeaponSel::Ar, radius: 3.0, fire_cooldown: 0.0 })
     .insert_resource(CursorHit::default())
     .insert_resource(Fx::default())
     .insert_resource(RenderState::default())
@@ -207,7 +267,7 @@ fn main() {
     .insert_resource(spec)
     .insert_resource(catalog)
     .insert_resource(ArgsRes(args.clone()))
-    .add_systems(Startup, setup)
+    .add_systems(Startup, (setup, shards::setup_shards, beam::setup_beam))
     .add_systems(
         Update,
         (
@@ -216,17 +276,30 @@ fn main() {
             camera_control,
             controls,
             render::sync_render,
+            shards::update_shards,
+            beam::draw_beam,
             overlay::draw_overlays,
             overlay::update_text,
         )
             .chain(),
     );
-    if let Some(path) = &args.screenshot {
+    if let Some(path) = args.screenshot.as_ref().or(args.record.as_ref()) {
+        if args.record.is_some() {
+            if let Err(e) = std::fs::create_dir_all(path) {
+                eprintln!("error: {}: {e}", path.display());
+                std::process::exit(1);
+            }
+        }
         app.insert_resource(Shot {
             path: path.clone(),
+            record_every: args.record.as_ref().map(|_| args.record_every),
+            demolish_frame: args.demolish_frame,
+            warmup: args.warmup,
+            done_frames: 0,
             frames: args.frames,
             explode: args.explode,
             explode_frame: args.explode_frame,
+            beam: args.beam,
             frame: 0,
             started: std::time::Instant::now(),
             sim_ms: 0.0,
@@ -353,6 +426,7 @@ fn cycle_buildings(
     mut fx: ResMut<Fx>,
     mut cams: Query<(&mut Transform, &mut CamCtl, Option<&mut DistanceFog>)>,
     mut windows: Query<&mut Window, With<PrimaryWindow>>,
+    shard_q: Query<Entity, With<shards::Shard>>,
 ) {
     let delta = if keys.any_just_pressed([KeyCode::Equal, KeyCode::NumpadAdd]) {
         1
@@ -375,8 +449,8 @@ fn cycle_buildings(
     };
     *sim = Sim::new(&new_spec);
     render::clear_entities(&mut commands, &mut rs);
+    shards::clear_shards(&mut commands, &shard_q);
     rs.reset(&sim);
-    fx.tracers.clear();
     fx.blasts.clear();
     println!(
         "rubble-viewer: [{}] {} | {} chunks, loaded in {:.0} ms",
@@ -440,35 +514,39 @@ fn controls(
     mut commands: Commands,
     keys: Res<ButtonInput<KeyCode>>,
     mouse: Res<ButtonInput<MouseButton>>,
-    time: Res<Time<Real>>,
     windows: Query<&Window, With<PrimaryWindow>>,
     cams: Query<(&Camera, &GlobalTransform)>,
     mut sim: ResMut<Sim>,
     spec: Res<WorldSpec>,
-    mut ctl: ResMut<Controls>,
     mut ov: ResMut<Overlays>,
     hit: Res<CursorHit>,
     mut fx: ResMut<Fx>,
     mut rs: ResMut<RenderState>,
+    shard_q: Query<Entity, With<shards::Shard>>,
 ) {
-    let dt = time.delta_secs();
     // toggles
-    if keys.just_pressed(KeyCode::F1) {
+    if keys.just_pressed(KeyCode::Digit1) {
         ov.graph = !ov.graph;
     }
-    if keys.just_pressed(KeyCode::F2) {
+    if keys.just_pressed(KeyCode::Digit2) {
         ov.anchors = !ov.anchors;
     }
-    if keys.just_pressed(KeyCode::F3) {
+    if keys.just_pressed(KeyCode::Digit3) {
         ov.random_colors = !ov.random_colors;
         rs.all_dirty = true;
     }
-    if keys.just_pressed(KeyCode::F4) {
+    if keys.just_pressed(KeyCode::Digit4) {
         ov.sleep_tint = !ov.sleep_tint;
     }
-    if keys.just_pressed(KeyCode::F5) {
+    if keys.just_pressed(KeyCode::Digit5) {
         ov.stats = !ov.stats;
     }
+    if keys.just_pressed(KeyCode::Digit6) {
+        ov.keep_debris = !ov.keep_debris;
+    }
+    // every frame, so a fresh world (reset, next building) picks it up too; affects debris
+    // created from now on
+    sim.world.cfg.keep_debris = ov.keep_debris;
     if keys.just_pressed(KeyCode::KeyH) {
         ov.help = !ov.help;
     }
@@ -479,34 +557,12 @@ fn controls(
         sim.paused = true;
         sim.step_once = true;
     }
-    if keys.just_pressed(KeyCode::Digit1) {
-        ctl.weapon = WeaponSel::Ar;
-    }
-    if keys.just_pressed(KeyCode::Digit2) {
-        ctl.weapon = WeaponSel::Sniper;
-    }
-    if keys.just_pressed(KeyCode::Digit3) {
-        ctl.weapon = WeaponSel::Launcher;
-    }
-    if keys.just_pressed(KeyCode::BracketLeft) {
-        ctl.radius = (ctl.radius - 0.5).max(0.5);
-    }
-    if keys.just_pressed(KeyCode::BracketRight) {
-        ctl.radius = (ctl.radius + 0.5).min(30.0);
-    }
     if keys.just_pressed(KeyCode::KeyR) {
         *sim = Sim::new(&spec);
         render::clear_entities(&mut commands, &mut rs);
+        shards::clear_shards(&mut commands, &shard_q);
         rs.reset(&sim);
-        fx.tracers.clear();
-        fx.blasts.clear();
-    }
-    if keys.just_pressed(KeyCode::KeyE) {
-        if let Some(p) = hit.0 {
-            let r = ctl.radius;
-            sim.world.explode(Explosion { center: to_engine(p), radius: r, inner_radius: r * 0.3, damage: EXPLOSION_DAMAGE, impulse: 1500.0 * r });
-            fx.blasts.push((p, r, 0.0));
-        }
+            fx.blasts.clear();
     }
     if keys.just_pressed(KeyCode::KeyG) {
         if let Some(p) = hit.0 {
@@ -514,57 +570,103 @@ fn controls(
             fx.blasts.push((p, 6.0, 0.0));
         }
     }
-    // firing
-    ctl.fire_cooldown -= dt;
-    let fire = match ctl.weapon {
-        WeaponSel::Ar => mouse.pressed(MouseButton::Left) && ctl.fire_cooldown <= 0.0,
-        _ => mouse.just_pressed(MouseButton::Left),
-    };
-    if fire {
+    // X: demolish the building under the cursor (all of them if the cursor is on nothing),
+    // fall side sideways relative to the view, left or right at random
+    if keys.just_pressed(KeyCode::KeyX) {
+        let seed = (sim.world.time * 1000.0) as u32 ^ sim.queued.len() as u32;
+        let view = view_ray(&windows, &cams).map_or([0.0, 1.0], |(_, d)| {
+            let e = to_engine(d);
+            [e[0], e[1]]
+        });
+        let side = if seed & 1 == 0 { 1.0 } else { -1.0 };
+        let a = side * std::f32::consts::FRAC_PI_2 + ((seed >> 1) % 61) as f32 / 60.0 * 1.0 - 0.5;
+        let (sn, cs) = a.sin_cos();
+        let fall = [cs * view[0] - sn * view[1], sn * view[0] + cs * view[1]];
+        let world_centre =
+            |b: usize| to_bevy(sim.world.buildings[b].pose.transform_point(rubble_core::Vec3::from_array(sim.centres[b].to_array())).to_array());
+        let targets: Vec<usize> = match hit.0 {
+            Some(p) => (0..sim.world.buildings.len())
+                .min_by(|&a, &b| world_centre(a).xz().distance(p.xz()).total_cmp(&world_centre(b).xz().distance(p.xz())))
+                .into_iter()
+                .collect(),
+            None => (0..sim.world.buildings.len()).collect(),
+        };
+        demolish_buildings(&mut sim, &mut fx, &targets, fall, seed);
+    }
+    // LMB (hold): cutting beam through everything in line, while the button is down
+    sim.beam = None;
+    fx.beam = None;
+    if mouse.pressed(MouseButton::Left) {
         if let Some((o, d)) = view_ray(&windows, &cams) {
-            let (oe, de) = (to_engine(o), to_engine(d));
-            let end = hit.0.unwrap_or(o + d * 300.0);
-            let muzzle = o + d * 0.5 - Vec3::Y * 0.25;
-            match ctl.weapon {
-                WeaponSel::Ar => {
-                    sim.world.fire(Projectile::hitscan(oe, de, Weapon::Ar));
-                    ctl.fire_cooldown = 0.1;
-                    fx.tracers.push((muzzle, end, 0.0, Color::srgb(1.0, 0.9, 0.4)));
-                }
-                WeaponSel::Sniper => {
-                    sim.world.fire(Projectile::hitscan(oe, de, Weapon::Sniper));
-                    fx.tracers.push((muzzle, end, 0.0, Color::srgb(0.5, 0.9, 1.0)));
-                }
-                WeaponSel::Launcher => {
-                    let r = ctl.radius;
-                    let e = Explosion { center: [0.0; 3], radius: r, inner_radius: r * 0.3, damage: EXPLOSION_DAMAGE, impulse: 1500.0 * r };
-                    sim.world.fire(Projectile::ballistic(oe, de, Weapon::Launcher).with_explosion(e));
-                    fx.tracers.push((muzzle, end, 0.0, Color::srgb(1.0, 0.4, 0.2)));
-                    if let Some(p) = hit.0 {
-                        let delay = (p - o).length() / Weapon::Launcher.params().speed;
-                        fx.blasts.push((p, r, -delay));
-                    }
-                }
-            }
+            sim.beam = Some((to_engine(o), to_engine(d)));
+            fx.beam = Some((o + d * 0.5 - Vec3::Y * 0.25, o + d * BEAM_RANGE));
         }
     }
 }
 
 /// Screenshot mode: one engine tick per rendered frame, scripted explosion, capture, exit.
+/// X: queue the demolition charges of `targets`, falling roughly along `fall` (engine xy).
+fn demolish_buildings(sim: &mut Sim, fx: &mut Fx, targets: &[usize], fall: [f32; 2], seed: u32) {
+    let t0 = sim.world.time;
+    for &b in targets {
+        let charges = demolish::charges(&sim.world, b, fall, seed.wrapping_add(b as u32));
+        let last = charges.iter().map(|k| k.delay).fold(0.0, f32::max);
+        sim.hurry.push((b as u32, t0 + last + 0.5));
+        for k in charges {
+            fx.blasts.push((to_bevy(k.blast.center), k.blast.radius, -k.delay));
+            sim.queued.push((t0 + k.delay, Scheduled::Explode(k.blast)));
+            sim.queued.push((t0 + k.delay, Scheduled::Damage(b as u32, k.chunks, 1e9)));
+        }
+    }
+}
+
 fn screenshot_driver(
     mut commands: Commands,
     mut shot: ResMut<Shot>,
     mut sim: ResMut<Sim>,
     spec: Res<WorldSpec>,
     mut fx: ResMut<Fx>,
+    mut exit: MessageWriter<AppExit>,
 ) {
     if shot.requested {
+        // record mode: many captures are in flight and the final one's exit hook does not
+        // always fire; give the readbacks a few frames, then quit
+        if shot.record_every.is_some() {
+            shot.done_frames += 1;
+            if shot.done_frames > 30 {
+                exit.write(AppExit::Success);
+            }
+        }
+        return;
+    }
+    if shot.frame == 0 && shot.started.elapsed().as_secs_f32() < shot.warmup {
         return;
     }
     if shot.frame == shot.explode_frame {
         if let Some([x, y, z, r, dmg]) = shot.explode {
             sim.world.explode(Explosion { center: [x, y, z], radius: r, inner_radius: r * 0.3, damage: dmg, impulse: 1500.0 * r });
             fx.blasts.push((to_bevy([x, y, z]), r, 0.0));
+        }
+    }
+    if shot.demolish_frame == Some(shot.frame) {
+        let targets: Vec<usize> = (0..sim.world.buildings.len()).collect();
+        demolish_buildings(&mut sim, &mut fx, &targets, [1.0, 0.0], 7);
+    }
+    if let Some(every) = shot.record_every {
+        if shot.frame % every == 0 && shot.frame + 1 < shot.frames {
+            let p = shot.path.join(format!("frame_{:05}.png", shot.frame / every));
+            let shot_of = match &shot.target {
+                Some(h) => Screenshot::image(h.clone()),
+                None => Screenshot::primary_window(),
+            };
+            commands.spawn(shot_of).observe(save_to_disk(p));
+        }
+    }
+    if let Some([x, y, z, dx, dy, dz]) = shot.beam {
+        if shot.frame >= shot.explode_frame {
+            sim.beam = Some(([x, y, z], [dx, dy, dz]));
+            let (o, d) = (to_bevy([x, y, z]), to_bevy([dx, dy, dz]).normalize());
+            fx.beam = Some((o, o + d * BEAM_RANGE));
         }
     }
     let t = std::time::Instant::now();
@@ -593,7 +695,10 @@ fn screenshot_driver(
                 Some(h) => Screenshot::image(h.clone()),
                 None => Screenshot::primary_window(),
             })
-            .observe(save_to_disk(shot.path.clone()))
+            .observe(save_to_disk(match shot.record_every {
+                Some(every) => shot.path.join(format!("frame_{:05}.png", shot.frame.div_ceil(every))),
+                None => shot.path.clone(),
+            }))
             .observe(|_: On<ScreenshotCaptured>, mut exit: MessageWriter<AppExit>| {
                 exit.write(AppExit::Success);
             });

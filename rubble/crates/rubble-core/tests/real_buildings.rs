@@ -43,6 +43,7 @@ fn presets() -> Vec<String> {
             v.push(format!("{p}_{s}"));
         }
     }
+    v.push("building4_4".into());
     v
 }
 

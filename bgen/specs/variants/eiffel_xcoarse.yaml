@@ -1,0 +1,21 @@
+# GENERATED variant of ../eiffel.yaml: fracture cell_size x2.5 (xcoarse: fewer, larger chunks).
+# Same layout as the base spec for a given seed; only the fracture differs.
+name: eiffel_xcoarse
+preset: structure
+seed: 1
+nodes:
+- sculpt:
+    template: eiffel
+    layer: 0.5
+    height: [88.0, 104.0]
+    spread: [0.95, 1.08]
+    ground: {pad: 4.0}
+fracture:
+  concrete: {cell_size: 4.0}
+  brick: {cell_size: 3.5}
+  wood:
+    cell_size: 1.75
+    anisotropy: [3, 1]
+  metal: {cell_size: 3.5}
+  glass: {mode: shatter_on_hit}
+stability: {accept_util: 0.8, max_rounds: 12}

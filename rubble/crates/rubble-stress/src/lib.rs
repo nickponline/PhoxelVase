@@ -23,12 +23,32 @@
 //! of "how much of the structure hangs off this bond", which is what gameplay needs.
 //!
 //! ## Capacities
-//! `capacity` is the joint's tensile/shear strength (area × bond strength). When an edge
-//! with a near-vertical normal (|n̂·z| ≥ 0.5) carries load *downward* it is in bearing
-//! (compression), and its capacity is multiplied by `compression_factor` (default 10:
-//! concrete/masonry are ~10× stronger in compression than in tension). Load hanging from
-//! above (upward flow) and lateral transfer through side joints use the plain capacity.
+//! `capacity` is the joint's tensile/shear strength (area × bond strength), scaled by the
+//! weaker endpoint's remaining strength (`StressInput::node_strength`, e.g. hp/hp_max).
+//! * **Bearing** (load moving down across a near-vertical-normal joint): × `compression_factor`
+//!   (3.5: bgen concrete bond 8 MPa → ~28 MPa crushing) × the buckling factor φ.
+//! * **Buckling** ([`StressGraph::with_columns`]): column chunks joined by vertical joints form
+//!   stacks; any joint to a non-column member (slab, beam, wall) or an anchor braces the stack
+//!   at that height. A chunk's unbraced length L is the distance between the nearest braces
+//!   below and above it (2× its height above the last brace for a free top), and
+//!   `φ = 1/(1 + (L/r)²/k)` (Rankine) with `r = thickness/√12`, `k = rankine_k` (1200): a 0.5 m
+//!   column braced every 3.5 m keeps 0.67, losing a bracing level drops it to ~0.33.
+//!   Recomputed whenever the topology changes.
+//! * **Bearing sections** (eccentric load, tipping): vertical-normal contacts between two
+//!   members (or, in an ungrouped structure, all those in a 0.5 m height band) form a section.
+//!   The load passing down through it (`N`) and its moment about the section centroid
+//!   (`m = Σ f·(C_up − c)`) give a linear stress field; each joint is checked at the extreme
+//!   fibres of its own patch, compression against `bond·compression_factor·φ`, tension against
+//!   `bond·tension_factor` (5: the members' reinforcement, as for flexure). A load centroid
+//!   outside the support puts the far side into tension: it breaks and the structure tips.
+//! * Lateral transfer through side joints and hanging load use the plain capacity.
 //!
+//! ## Catch-up after big damage
+//! The tick's removed joints are summed by the flow they carried; if that exceeds
+//! `catchup_frac` (5 %) of the total supported load, the building is solved globally to
+//! convergence within the same call (≤ `catchup_max_ms`), so utilization reflects the damage
+//! at once instead of creeping up over seconds of warm-started windowed iterations.
+
 //! ## Bending term (`cfg.bending`)
 //! For edges with near-horizontal contact normal (`|n·z| < 0.5`) we add a moment estimate
 //! `M_e = |f_e| · |(C_up − c_e)·n̂_h|`: the **net** lateral load through the joint times the
@@ -115,12 +135,18 @@ pub const DEFAULT_BOND_STRENGTH: f32 = 1.0e6;
 
 /// Unconverged local ticks at the maximum window size before escalating to global steps.
 const STALL_TICKS: usize = 8;
+/// PCG iterations per catch-up round (rounds repeat until converged or out of time).
+const CATCHUP_ROUND_ITERS: usize = 250;
 
 /// Intra-member cuts: horizontal-normal joints are grouped by direction (CUT_BINS bins over
 /// 180°) and by position along that direction (CUT_BIN m slabs).
 const CUT_BINS: usize = 6;
 const CUT_ANGLE: f64 = std::f64::consts::PI / CUT_BINS as f64;
 const CUT_BIN: f64 = 1.0;
+/// Height band (m) of intra-member bearing sections (two staggered bandings).
+const BEAR_BAND: f64 = 0.5;
+const SEC_BEND: u8 = 0;
+const SEC_BEAR: u8 = 1;
 /// cut key -> (edge, slot (2 = inter-member), orientation sign)
 type CutBuckets = std::collections::HashMap<(u32, u32, i64), Vec<(u32, u8, f32)>>;
 
@@ -152,6 +178,13 @@ pub struct StressGraph {
     iface_edges: Vec<u32>,
     /// Oriented unit horizontal normal per interface (from lower to higher group id).
     iface_n: Vec<[f32; 2]>,
+    /// Section kind: SEC_BEND (horizontal-normal joints: bending cut / interface) or
+    /// SEC_BEAR (vertical-normal joints: bearing section with eccentricity, i.e. tipping).
+    sec_kind: Vec<u8>,
+    /// Node centre z (absolute).
+    node_z: Vec<f32>,
+    /// Column section thickness per node (0 = not a column); see [`StressGraph::with_columns`].
+    col_thick: Vec<f32>,
     /// Node position xy relative to `origin`.
     node_xy: Vec<[f32; 2]>,
     horizontal: Vec<bool>,
@@ -280,6 +313,9 @@ impl StressGraph {
             iface_off: vec![0],
             iface_edges: Vec::new(),
             iface_n: Vec::new(),
+            sec_kind: Vec::new(),
+            node_z: node_pos.iter().map(|p| p[2]).collect(),
+            col_thick: Vec::new(),
             node_xy,
             horizontal,
             vert_sign,
@@ -290,6 +326,8 @@ impl StressGraph {
             length_scale,
         };
         g.update_bend_coef();
+        let zeros = vec![0u32; n_nodes];
+        g.build_sections(&zeros, false);
         g
     }
 
@@ -301,25 +339,60 @@ impl StressGraph {
         self
     }
 
-    /// Group nodes (chunk → element/panel id). Horizontal-normal edges joining two different
-    /// groups form an **interface** keyed by the unordered group pair; bending is then
-    /// evaluated per interface (one cut section made of all its alive contacts) instead of
-    /// per contact, and every edge of the interface gets the interface's bending utilization.
-    /// Without groups every horizontal edge is its own section.
+    /// Group nodes (chunk → element/panel id). Joints are then evaluated per *section*:
+    /// * horizontal-normal joints (bending): all contacts between two members form an
+    ///   **interface**; joints inside a member form planar **cuts** (see crate docs);
+    /// * vertical-normal joints (bearing): contacts between two members (e.g. a wall standing
+    ///   on a slab, a column under a slab) form one bearing section; joints inside a member
+    ///   only get the per-joint axial check.
+    ///
+    /// Without groups, horizontal joints are their own sections and bearing sections are the
+    /// height bands of the whole structure.
     pub fn with_node_groups(mut self, group: &[u32]) -> Self {
         assert_eq!(group.len(), self.n, "group len");
         if group.iter().all(|&x| x == group.first().copied().unwrap_or(0)) {
-            return self; // a single member carries no structure information: per-joint sections
+            return self; // a single member carries no structure information
         }
+        self.build_sections(group, true);
+        self.group = group.to_vec();
+        self
+    }
+
+    /// Mark column nodes with their section thickness (m; min horizontal size, 0 = not a
+    /// column). Column stacks get a buckling (Rankine) reduction of their compression capacity
+    /// from the unbraced length between lateral bracing (see crate docs).
+    pub fn with_columns(mut self, thickness: &[f32]) -> Self {
+        assert_eq!(thickness.len(), self.n, "thickness len");
+        self.col_thick = if thickness.iter().any(|&t| t > 0.0) { thickness.to_vec() } else { Vec::new() };
+        self
+    }
+
+    fn build_sections(&mut self, group: &[u32], horizontal_cuts: bool) {
         let m = self.edge_ab.len();
-        // 1. bucket (edge, slot, orientation sign) entries by cut key
+        // 1. bucket (edge, slot, orientation sign) entries by section key
         let mut buckets: CutBuckets = std::collections::HashMap::new();
         for e in 0..m {
-            if !self.horizontal[e] {
-                continue;
-            }
             let [a, b] = self.edge_ab[e];
             let (ga, gb) = (group[a as usize], group[b as usize]);
+            if self.vert_sign[e] != 0 {
+                // bearing sections
+                if ga != gb {
+                    buckets.entry((ga.min(gb), ga.max(gb), i64::MIN + 1)).or_default().push((e as u32, 2, 1.0));
+                } else if !horizontal_cuts {
+                    // ungrouped structure: height bands of the whole structure. (Within a real
+                    // member the Voronoi joints of a band are a partial, noisy section and the
+                    // member's own load centroid is a mixture; members are checked at their
+                    // interfaces instead.)
+                    for slot in 0..2u8 {
+                        let zb = (self.edge_z[e] as f64 / BEAR_BAND + 0.5 * slot as f64).floor() as i64;
+                        buckets.entry((ga, u32::MAX - 100 - slot as u32, zb)).or_default().push((e as u32, slot, 1.0));
+                    }
+                }
+                continue;
+            }
+            if !horizontal_cuts || !self.horizontal[e] {
+                continue;
+            }
             let n = self.nrm_h[e];
             if ga != gb {
                 // inter-member interface: all contacts between the two members
@@ -351,10 +424,12 @@ impl StressGraph {
         let mut off = vec![0u32];
         let mut edges: Vec<u32> = Vec::new();
         let mut iface_n: Vec<[f32; 2]> = Vec::new();
+        let mut kind: Vec<u8> = Vec::new();
         for key in keys {
             let list = buckets.remove(&key).unwrap();
             let id = iface_n.len() as u32;
             let mut ns = [0f64; 2];
+            let bearing = self.vert_sign[list[0].0 as usize] != 0;
             for &(e, slot, sgn) in &list {
                 let eu = e as usize;
                 if slot == 2 {
@@ -368,15 +443,15 @@ impl StressGraph {
                 ns[1] += sgn as f64 * w * n[1] as f64;
             }
             let l = (ns[0] * ns[0] + ns[1] * ns[1]).sqrt();
-            iface_n.push(if l > 0.0 { [(ns[0] / l) as f32, (ns[1] / l) as f32] } else { [0.0, 0.0] });
+            iface_n.push(if l > 0.0 && !bearing { [(ns[0] / l) as f32, (ns[1] / l) as f32] } else { [0.0, 0.0] });
+            kind.push(if bearing { SEC_BEAR } else { SEC_BEND });
             off.push(edges.len() as u32);
         }
         self.iface_n = iface_n;
-        self.group = group.to_vec();
+        self.sec_kind = kind;
         self.iface_of = iface_of;
         self.iface_off = off;
         self.iface_edges = edges;
-        self
     }
 
     /// Number of inter-group bending interfaces.
@@ -430,12 +505,16 @@ impl StressGraph {
 }
 
 /// Per-tick inputs (all indexed by node / edge id).
+#[derive(Default, Clone, Copy)]
 pub struct StressInput<'a> {
     /// `m·g` per node (N).
     pub node_weight: &'a [f32],
     pub node_alive: &'a [bool],
     pub anchor: &'a [bool],
     pub edge_alive: &'a [bool],
+    /// Remaining strength fraction per node (e.g. hp / hp_max; empty = all 1). An edge's
+    /// capacity is scaled by the weaker of its two nodes, so damaged supports fail under load.
+    pub node_strength: &'a [f32],
 }
 
 #[derive(Clone, Debug)]
@@ -458,9 +537,29 @@ pub struct StressConfig {
     /// towers stay < 0.5 while losing 3 of 5 ground-floor columns collapses a tower).
     pub flexural_factor: f32,
     /// Capacity multiplier when an edge with near-vertical normal carries load downward
-    /// (bearing/compression). Concrete and masonry are ~10× stronger in compression than in
-    /// tension; `capacity` (= area × bond strength) is the tensile/shear value. Default 10.
+    /// (bearing/compression), also used on the compression side of bearing sections.
+    /// `capacity` (= area × bond strength) is the tensile/shear value; with bgen's concrete
+    /// bond (8 MPa) the default 3.5 gives ~28 MPa crushing strength.
     pub compression_factor: f32,
+    /// Tension capacity multiplier on the far side of an eccentrically loaded bearing section:
+    /// the same reinforcement that gives members their flexural capacity carries tension
+    /// across horizontal joints (a moment taken by a beam root continues down the column).
+    /// Default 5 (= `flexural_factor`). A load centroid outside the support still tips: the
+    /// required tension grows with the eccentricity while the section stays small.
+    pub tension_factor: f32,
+    /// Evaluate bearing sections (vertical-normal joints: eccentric load, tipping). Needs
+    /// `bending` (uses the carried-load centroids).
+    pub bearing_sections: bool,
+    /// Rankine buckling of column stacks (see [`StressGraph::with_columns`]).
+    pub buckling: bool,
+    /// Rankine constant k in `φ = 1 / (1 + (L/r)²/k)`. 1200: a 0.5 m column braced every
+    /// 3.5 m keeps φ ≈ 0.67; losing one bracing level (L doubled) gives ≈ 0.33.
+    pub rankine_k: f32,
+    /// Catch-up: when one tick removes support carrying more than this fraction of the total
+    /// load (sum of flows through removed joints), solve globally to convergence right away
+    /// (time-capped by `catchup_max_ms`). 0 disables.
+    pub catchup_frac: f32,
+    pub catchup_max_ms: f32,
     /// Max nodes in a local (warm) solve region; graphs with ≤ this many supported nodes
     /// are always solved globally.
     pub region_max_nodes: usize,
@@ -487,8 +586,14 @@ impl Default for StressConfig {
             bending: true,
             bend_scale: 1.0,
             flexural_factor: 5.0,
-            compression_factor: 10.0,
-            region_max_nodes: 4096,
+            compression_factor: 3.5,
+            tension_factor: 5.0,
+            bearing_sections: true,
+            buckling: true,
+            rankine_k: 1200.0,
+            catchup_frac: 0.05,
+            catchup_max_ms: 20.0,
+            region_max_nodes: 16384,
             max_region_growth: 4,
             local_tol_factor: 10.0,
             par_threshold: 32768,
@@ -558,6 +663,18 @@ pub struct StressState {
     iface_mark: Vec<bool>,
     /// Latest bending utilization per cut/interface.
     cut_bend: Vec<f32>,
+    /// Latest bearing-section utilization per edge and slot.
+    sec_u: Vec<[f32; 2]>,
+    /// Buckling factor per node (1 = none) and the topology version it was computed for.
+    phi: Vec<f32>,
+    phi_version: u64,
+    /// Strength fraction per node (from `StressInput::node_strength`).
+    strength: Vec<f32>,
+    /// Nodes whose capacities changed without a re-solve (damage, buckling): util refresh.
+    cap_moved: Vec<u32>,
+    /// Sum of |flow| through joints removed since the last solve (catch-up trigger).
+    removed_flow: f64,
+    total_load: f64,
     edge_k: Vec<f32>,
     prev_alive: Vec<bool>,
     prev_anchor: Vec<bool>,
@@ -603,6 +720,13 @@ impl StressState {
             iface_dirty: Vec::new(),
             iface_mark: vec![false; g.iface_n.len()],
             cut_bend: vec![0.0; g.iface_n.len()],
+            sec_u: vec![[0.0; 2]; m],
+            phi: vec![1.0; n],
+            phi_version: 0,
+            strength: vec![1.0; n],
+            cap_moved: Vec::new(),
+            removed_flow: 0.0,
+            total_load: 0.0,
             edge_k: vec![0.0; m],
             prev_alive: vec![false; n],
             prev_anchor: vec![false; n],
@@ -636,6 +760,12 @@ impl StressState {
     /// Current utilization (same as the last `StressResult::utilization`), without a copy.
     pub fn utilization(&self) -> &[f32] {
         &self.util
+    }
+    /// True if any edge has utilization > 1 (same as `utilization().iter().any(|&u| u > 1.0)`
+    /// after a solve step: the hysteresis pass leaves exactly those edges on the hot list).
+    pub fn any_overloaded(&self) -> bool {
+        debug_assert_eq!(!self.hot.is_empty(), self.util.iter().any(|&u| u > 1.0));
+        !self.hot.is_empty()
     }
     /// Load potential φ of node i (0 for anchors / dead / unsupported).
     pub fn potential(&self, i: u32) -> f64 {
@@ -773,6 +903,10 @@ impl StressState {
         let old = self.edge_k[e];
         if k == old {
             return None;
+        }
+        if old > 0.0 {
+            let [a, b] = g.edge_ab[e];
+            self.removed_flow += (old as f64 * (self.pot[a as usize] - self.pot[b as usize])).abs();
         }
         self.edge_k[e] = k;
         self.version += 1;
@@ -925,8 +1059,6 @@ impl StressState {
                         self.prev_alive[i] = alive;
                         if alive {
                             additions = true;
-                        } else {
-                            self.set_class(g, i, DEAD);
                         }
                         for p in g.row(i) {
                             let e = g.adj_edge[p] as usize;
@@ -939,6 +1071,9 @@ impl StressState {
                                     removal_seeds.push(b);
                                 }
                             }
+                        }
+                        if !alive {
+                            self.set_class(g, i, DEAD);
                         }
                     }
                     if self.prev_anchor[i] != anchor {
@@ -998,6 +1133,110 @@ impl StressState {
                 self.check_support(g, s as usize, base);
             }
         }
+        self.sync_strength(input);
+    }
+
+    fn sync_strength(&mut self, input: &StressInput) {
+        if input.node_strength.is_empty() {
+            return;
+        }
+        assert_eq!(input.node_strength.len(), self.strength.len(), "node_strength len");
+        for (i, (&s, cur)) in input.node_strength.iter().zip(self.strength.iter_mut()).enumerate() {
+            let s = s.clamp(0.0, 1.0);
+            if s != *cur {
+                *cur = s;
+                self.cap_moved.push(i as u32);
+            }
+        }
+    }
+
+    /// Rankine buckling factor of column nodes from the unbraced length of their stack.
+    fn update_buckling(&mut self, g: &StressGraph, cfg: &StressConfig) {
+        if g.col_thick.is_empty() {
+            return;
+        }
+        if !cfg.buckling {
+            for i in 0..g.n {
+                if self.phi[i] != 1.0 {
+                    self.phi[i] = 1.0;
+                    self.cap_moved.push(i as u32);
+                }
+            }
+            self.phi_version = 0;
+            return;
+        }
+        if self.phi_version == self.version {
+            return;
+        }
+        self.phi_version = self.version;
+        let alive = |c: u8| c == UNKNOWN || c == ANCHOR;
+        let tag = self.next_search_id();
+        let mut stack: Vec<u32> = Vec::new();
+        let mut braces: Vec<f32> = Vec::new();
+        for s0 in 0..g.n {
+            if g.col_thick[s0] <= 0.0 || !alive(self.class[s0]) || self.visit[s0] == tag {
+                continue;
+            }
+            // collect the stack: column nodes joined by conducting vertical joints
+            stack.clear();
+            braces.clear();
+            stack.push(s0 as u32);
+            self.visit[s0] = tag;
+            let mut head = 0;
+            while head < stack.len() {
+                let i = stack[head] as usize;
+                head += 1;
+                if self.class[i] == ANCHOR {
+                    braces.push(g.node_z[i]);
+                }
+                for p in g.row(i) {
+                    let e = g.adj_edge[p] as usize;
+                    if self.edge_k[e] == 0.0 {
+                        continue;
+                    }
+                    let j = g.adj_node[p] as usize;
+                    if !alive(self.class[j]) {
+                        continue;
+                    }
+                    if g.col_thick[j] > 0.0 && g.vert_sign[e] != 0 {
+                        if self.visit[j] != tag {
+                            self.visit[j] = tag;
+                            stack.push(j as u32);
+                        }
+                    } else if g.col_thick[j] <= 0.0 {
+                        braces.push(g.edge_z[e]); // lateral support from another member
+                    }
+                }
+            }
+            braces.sort_by(f32::total_cmp);
+            let ztop = stack.iter().map(|&i| g.node_z[i as usize]).fold(f32::NEG_INFINITY, f32::max);
+            for &i in &stack {
+                let i = i as usize;
+                let z = g.node_z[i];
+                let below = braces.iter().rev().find(|&&b| b <= z + 1e-4).copied();
+                let above = braces.iter().find(|&&b| b >= z - 1e-4).copied();
+                let phi = match (below, above) {
+                    (Some(lo), Some(hi)) if hi > lo => Self::rankine(hi - lo, g.col_thick[i], cfg.rankine_k),
+                    (Some(lo), None) => Self::rankine(2.0 * (ztop - lo).max(0.0), g.col_thick[i], cfg.rankine_k),
+                    _ => 1.0, // braced at the node itself, or hanging (no compression)
+                };
+                if (phi - self.phi[i]).abs() > 1e-4 {
+                    self.phi[i] = phi;
+                    self.cap_moved.push(i as u32);
+                }
+            }
+        }
+    }
+
+    fn rankine(l: f32, thick: f32, k: f32) -> f32 {
+        let r = thick.max(1e-3) / 12f32.sqrt();
+        let s = l / r;
+        1.0 / (1.0 + s * s / k.max(1e-3))
+    }
+
+    /// Buckling factor of node i (1 = not a column / no reduction).
+    pub fn buckling_factor(&self, i: u32) -> f32 {
+        self.phi[i as usize]
     }
 
     fn update_stats(&mut self, input: &StressInput) {
@@ -1015,6 +1254,7 @@ impl StressState {
         }
         self.n_unknown = cnt;
         self.w_rms = if cnt > 0 { (s2 / cnt as f64).sqrt() } else { 0.0 };
+        self.total_load = (0..self.class.len()).filter(|&i| self.class[i] == UNKNOWN).map(|i| input.node_weight[i] as f64).sum();
     }
 
     #[inline]
@@ -1025,12 +1265,17 @@ impl StressState {
         }
         let [a, b] = g.edge_ab[e];
         let f = k as f64 * (self.pot[a as usize] - self.pot[b as usize]);
+        let s = self.edge_strength(g, e);
         // load moving down across a horizontal-ish contact = bearing (compression)
         let vs = g.vert_sign[e] as f64;
-        let cap = if vs * f < 0.0 { g.capacity[e] * up.compression } else { g.capacity[e] };
+        let cap = if vs * f < 0.0 {
+            g.capacity[e] * s * up.compression * self.edge_phi(g, e)
+        } else {
+            g.capacity[e] * s
+        };
         let mut u = f.abs() / cap as f64;
         if up.bending && g.bend_coef[e] > 0.0 && g.iface_of[e][0] == u32::MAX {
-            u += (up.bend_k * g.bend_coef[e]) as f64 * self.moment(g, e, f);
+            u += (up.bend_k * g.bend_coef[e] / s) as f64 * self.moment(g, e, f);
         }
         u as f32
     }
@@ -1076,8 +1321,14 @@ impl StressState {
         let eps_c = 1e-4 * g.length_scale;
         self.moved.clear();
         if full {
-            let mut order: Vec<u32> = (0..g.n as u32).filter(|&i| self.class[i as usize] == UNKNOWN).collect();
-            order.sort_unstable_by(|&a, &b| self.pot[b as usize].total_cmp(&self.pot[a as usize]).then(a.cmp(&b)));
+            // descending potential, ties by id (a total order: any sort gives this sequence).
+            // Keyed on the `total_cmp` bit pattern so the sort compares plain integers.
+            let mut keyed: Vec<(u64, u32)> = (0..g.n as u32)
+                .filter(|&i| self.class[i as usize] == UNKNOWN)
+                .map(|i| (desc_total_key(self.pot[i as usize]), i))
+                .collect();
+            keyed.sort_unstable();
+            let order: Vec<u32> = keyed.into_iter().map(|(_, i)| i).collect();
             for &i in &order {
                 self.recompute_load(g, input, i as usize, eps_c);
             }
@@ -1118,11 +1369,26 @@ impl StressState {
         self.heap = heap;
     }
 
+    /// Capacity fraction of edge e from damage (weaker endpoint).
+    #[inline]
+    fn edge_strength(&self, g: &StressGraph, e: usize) -> f32 {
+        let [a, b] = g.edge_ab[e];
+        self.strength[a as usize].min(self.strength[b as usize]).max(0.02)
+    }
+    #[inline]
+    fn edge_phi(&self, g: &StressGraph, e: usize) -> f32 {
+        let [a, b] = g.edge_ab[e];
+        self.phi[a as usize].min(self.phi[b as usize])
+    }
+
     fn refresh_util_of(&mut self, g: &StressGraph, i: usize, up: &UtilParams) {
         for p in g.row(i) {
             let e = g.adj_edge[p] as usize;
             let ids = g.iface_of[e];
-            if up.bending && ids[0] != u32::MAX {
+            let routed = ids[0] != u32::MAX
+                && up.bending
+                && (g.sec_kind[ids[0] as usize] == SEC_BEND || up.bearing);
+            if routed {
                 if self.iface_mark.len() != g.iface_n.len() {
                     self.iface_mark = vec![false; g.iface_n.len()];
                     self.cut_bend = vec![0.0; g.iface_n.len()];
@@ -1158,23 +1424,111 @@ impl StressState {
     fn flush_interfaces(&mut self, g: &StressGraph, up: &UtilParams) {
         let dirty = std::mem::take(&mut self.iface_dirty);
         for &id in &dirty {
-            self.cut_bend[id as usize] = self.cut_bending(g, id as usize, up.bend_k);
+            if g.sec_kind[id as usize] == SEC_BEND {
+                self.cut_bend[id as usize] = self.cut_bending(g, id as usize, up.bend_k);
+            } else {
+                self.bearing_section(g, id as usize, up);
+            }
         }
         for &id in &dirty {
             self.iface_mark[id as usize] = false;
+            let bend = g.sec_kind[id as usize] == SEC_BEND;
             let (s0, s1) = (g.iface_off[id as usize] as usize, g.iface_off[id as usize + 1] as usize);
             for &e in &g.iface_edges[s0..s1] {
                 let e = e as usize;
                 let mut u = self.compute_util(g, e, up);
                 if self.edge_k[e] != 0.0 {
                     let [c0, c1] = g.iface_of[e];
-                    u += self.cut_bend[c0 as usize].min(self.cut_bend[c1 as usize]);
+                    if bend {
+                        u += self.cut_bend[c0 as usize].min(self.cut_bend[c1 as usize]);
+                    } else {
+                        u = u.max(self.sec_u[e][0].min(self.sec_u[e][1]));
+                    }
                 }
                 self.set_util(e, u);
             }
         }
         self.iface_dirty = dirty;
         self.iface_dirty.clear();
+    }
+
+    /// Bearing section (vertical-normal joints of one member pair / height band): axial load
+    /// `N` of the load passing down through it and its moment `m = Σ f·(C_up − c)` about the
+    /// section centroid give a linear stress field `σ(p) = N/A + (p − c)·J⁻¹m` (J: second
+    /// moments of the contact areas, each contact also counting its own `A²/12`). Each joint
+    /// is checked at the extreme fibres of its own patch (±√A/2 along the stress gradient):
+    /// compression against `bond·compression_factor·φ`, tension against `bond·tension_factor`
+    /// (`bond = capacity/area`, damage-scaled). A load centroid outside the support makes the
+    /// far side go into tension and break: the structure tips.
+    fn bearing_section(&mut self, g: &StressGraph, id: usize, up: &UtilParams) {
+        let edges = &g.iface_edges[g.iface_off[id] as usize..g.iface_off[id + 1] as usize];
+        let (mut area, mut cx, mut cy) = (0f64, 0f64, 0f64);
+        for &e in edges {
+            let e = e as usize;
+            if self.edge_k[e] != 0.0 {
+                let a = g.area[e].max(1e-9) as f64;
+                area += a;
+                cx += a * g.centroid_xy[e][0] as f64;
+                cy += a * g.centroid_xy[e][1] as f64;
+            }
+        }
+        let slot_of = |e: usize| if g.iface_of[e][0] as usize == id { 0 } else { 1 };
+        if area <= 0.0 {
+            for &e in edges {
+                let e = e as usize;
+                self.sec_u[e][slot_of(e)] = 0.0;
+            }
+            return;
+        }
+        let (cx, cy) = (cx / area, cy / area);
+        let (mut jxx, mut jyy, mut jxy) = (0f64, 0f64, 0f64);
+        let (mut nload, mut mx, mut my) = (0f64, 0f64, 0f64);
+        for &e in edges {
+            let e = e as usize;
+            let k = self.edge_k[e];
+            if k == 0.0 {
+                continue;
+            }
+            let a = g.area[e].max(1e-9) as f64;
+            let (dx, dy) = (g.centroid_xy[e][0] as f64 - cx, g.centroid_xy[e][1] as f64 - cy);
+            jxx += a * dx * dx + a * a / 12.0;
+            jyy += a * dy * dy + a * a / 12.0;
+            jxy += a * dx * dy;
+            let [na, nb] = g.edge_ab[e];
+            let f = k as f64 * (self.pot[na as usize] - self.pot[nb as usize]);
+            let down = -f * g.vert_sign[e] as f64; // > 0: load moves down across the joint
+            if down > 0.0 {
+                let upn = if f > 0.0 { na } else { nb } as usize;
+                let c = self.load_c[upn];
+                nload += down;
+                mx += down * (c[0] as f64 - cx);
+                my += down * (c[1] as f64 - cy);
+            }
+        }
+        let det = jxx * jyy - jxy * jxy;
+        let (gx, gy) = if nload > 0.0 && det > 1e-18 {
+            ((jyy * mx - jxy * my) / det, (jxx * my - jxy * mx) / det)
+        } else {
+            (0.0, 0.0)
+        };
+        let gn = (gx * gx + gy * gy).sqrt();
+        let s0 = nload / area;
+        for &e in edges {
+            let e = e as usize;
+            let slot = slot_of(e);
+            if self.edge_k[e] == 0.0 || nload <= 0.0 {
+                self.sec_u[e][slot] = 0.0;
+                continue;
+            }
+            let a = g.area[e].max(1e-9) as f64;
+            let (dx, dy) = (g.centroid_xy[e][0] as f64 - cx, g.centroid_xy[e][1] as f64 - cy);
+            let sc = s0 + dx * gx + dy * gy;
+            let half = 0.5 * a.sqrt() * gn;
+            let bond = (g.capacity[e] * self.edge_strength(g, e)) as f64 / a;
+            let uc = (sc + half).max(0.0) / (bond * (up.compression * self.edge_phi(g, e)) as f64);
+            let ut = (half - sc).max(0.0) / (bond * up.tension as f64);
+            self.sec_u[e][slot] = uc.max(ut) as f32;
+        }
     }
 
     fn cut_bending(&self, g: &StressGraph, id: usize, bend_k: f32) -> f32 {
@@ -1187,7 +1541,7 @@ impl StressState {
                 continue;
             }
             let a = g.area[e].max(1e-9) as f64;
-            cap += g.capacity[e] as f64;
+            cap += (g.capacity[e] * self.edge_strength(g, e)) as f64;
             area += a;
             cx += a * g.centroid_xy[e][0] as f64;
             cy += a * g.centroid_xy[e][1] as f64;
@@ -1409,14 +1763,49 @@ impl StressState {
     }
 }
 
+/// Unsigned key that sorts ascending in *descending* `f64::total_cmp` order.
+#[inline]
+fn desc_total_key(x: f64) -> u64 {
+    let b = x.to_bits() as i64;
+    // `total_cmp`'s signed key, then shifted to unsigned
+    let t = (b ^ ((((b >> 63) as u64) >> 1) as i64)) as u64 ^ (1u64 << 63);
+    !t
+}
+
+#[cfg(test)]
+mod key_tests {
+    #[test]
+    fn desc_total_key_matches_total_cmp() {
+        let v = [
+            0.0, -0.0, 1.0, -1.0, 1e-300, -1e-300, f64::MIN_POSITIVE, f64::INFINITY, f64::NEG_INFINITY, 3.5, -3.5,
+            1e300, -1e300, f64::NAN, -f64::NAN, 2.0, 2.0000000000000004,
+        ];
+        for &a in &v {
+            for &b in &v {
+                assert_eq!(super::desc_total_key(a).cmp(&super::desc_total_key(b)), b.total_cmp(&a), "{a} {b}");
+            }
+        }
+    }
+}
+
 struct UtilParams {
     bending: bool,
+    bearing: bool,
     bend_k: f32,
     compression: f32,
+    tension: f32,
 }
 
 /// One amortized solver tick (see crate docs).
 pub fn solve_step(g: &StressGraph, st: &mut StressState, input: &StressInput, cfg: &StressConfig, dt: f32) -> StressResult {
+    let mut r = solve_step_lean(g, st, input, cfg, dt);
+    r.utilization = st.util.clone();
+    r
+}
+
+/// [`solve_step`] without the utilization copy: `StressResult::utilization` is left empty, read
+/// it from [`StressState::utilization`] instead.
+pub fn solve_step_lean(g: &StressGraph, st: &mut StressState, input: &StressInput, cfg: &StressConfig, dt: f32) -> StressResult {
     st.sync(g, input);
     let bend_full = cfg.bending && !st.moments_valid;
     st.moments_valid = cfg.bending;
@@ -1430,19 +1819,43 @@ pub fn solve_step(g: &StressGraph, st: &mut StressState, input: &StressInput, cf
         }
         st.pending.clear();
     }
+    // Catch-up: a tick that removed support carrying a large share of the load gets a full
+    // global solve to convergence now (time-capped), so utilization reflects the damage within
+    // a tick instead of creeping up over seconds of warm-started local iterations.
+    let catchup = cfg.catchup_frac > 0.0 && st.removed_flow > cfg.catchup_frac as f64 * st.total_load && solving;
+    st.removed_flow = 0.0;
     let mut region = Vec::new();
     if solving {
-        iters = st.solve(g, input, cfg, cfg.max_iters);
+        if catchup {
+            st.need_global = true;
+            let t0 = std::time::Instant::now();
+            loop {
+                iters += st.solve(g, input, cfg, cfg.max_iters.max(CATCHUP_ROUND_ITERS));
+                if !st.need_global || t0.elapsed().as_secs_f32() * 1e3 > cfg.catchup_max_ms {
+                    break;
+                }
+            }
+        } else {
+            iters = st.solve(g, input, cfg, cfg.max_iters);
+        }
         region = std::mem::take(&mut st.sys.nodes);
     }
+    st.update_buckling(g, cfg);
     let up = UtilParams {
         bending: cfg.bending,
+        bearing: cfg.bearing_sections,
         bend_k: cfg.bend_scale / cfg.flexural_factor.max(1e-6),
         compression: cfg.compression_factor.max(1e-6),
+        tension: cfg.tension_factor.max(1e-6),
     };
+    // a full moment update over a global solve moves exactly the solved nodes: their edges are
+    // refreshed once below (a second pass would recompute the same values)
+    let mut moved_is_region = false;
     if cfg.bending && (solving || bend_full) {
         let full = bend_full || region.len() * 2 > st.n_unknown;
         st.update_moments(g, input, &region, full);
+        // region ⊆ supported nodes and `moved` = all supported nodes after a full update
+        moved_is_region = full && region.len() == st.moved.len();
     } else {
         st.moved.clear();
     }
@@ -1452,13 +1865,21 @@ pub fn solve_step(g: &StressGraph, st: &mut StressState, input: &StressInput, cf
     for &i in &region {
         st.refresh_util_of(g, i as usize, &up);
     }
-    if cfg.bending {
+    if cfg.bending && !moved_is_region {
         let moved = std::mem::take(&mut st.moved);
         for &i in &moved {
             st.refresh_util_of(g, i as usize, &up);
         }
         st.moved = moved;
     }
+    let cap_moved = std::mem::take(&mut st.cap_moved);
+    for &i in &cap_moved {
+        if st.class[i as usize] == UNKNOWN || st.class[i as usize] == ANCHOR {
+            st.refresh_util_of(g, i as usize, &up);
+        }
+    }
+    st.cap_moved = cap_moved;
+    st.cap_moved.clear();
     st.flush_interfaces(g, &up);
     if solving {
         st.sys.nodes = region;
@@ -1483,7 +1904,7 @@ pub fn solve_step(g: &StressGraph, st: &mut StressState, input: &StressInput, cf
     cands.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
     cands.truncate(cfg.max_breaks_per_tick);
     StressResult {
-        utilization: st.util.clone(),
+        utilization: Vec::new(),
         to_break: cands.into_iter().map(|(_, e)| e).collect(),
         converged: !st.need_global && st.pending.is_empty(),
         iters,

@@ -71,14 +71,21 @@ pub struct Materials {
 #[allow(dead_code)] // key kept for debugging / inspection
 pub struct ChunkGroup(pub GroupKey);
 
+/// `base_color` of each chunk material (multiplied by the per-chunk vertex colour); also used by
+/// the dynamic-tint legend in the help box.
+pub const TINT_BASE: Color = Color::WHITE;
+pub const TINT_AWAKE: Color = Color::srgb(1.0, 0.55, 0.25);
+pub const TINT_ASLEEP: Color = Color::srgb(0.35, 0.55, 1.0);
+pub const TINT_FROZEN: Color = Color::srgb(0.7, 0.55, 0.8);
+
 impl Materials {
     pub fn new(mats: &mut Assets<StandardMaterial>) -> Self {
         let mk = |c: Color| StandardMaterial { base_color: c, perceptual_roughness: 0.85, reflectance: 0.3, ..default() };
         Materials {
-            base: mats.add(mk(Color::WHITE)),
-            awake: mats.add(mk(Color::srgb(1.0, 0.55, 0.25))),
-            asleep: mats.add(mk(Color::srgb(0.35, 0.55, 1.0))),
-            frozen: mats.add(mk(Color::srgb(0.7, 0.55, 0.8))),
+            base: mats.add(mk(TINT_BASE)),
+            awake: mats.add(mk(TINT_AWAKE)),
+            asleep: mats.add(mk(TINT_ASLEEP)),
+            frozen: mats.add(mk(TINT_FROZEN)),
         }
     }
 }

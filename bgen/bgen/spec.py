@@ -132,6 +132,14 @@ PRESETS: dict[str, dict] = {
                                            "width": [0.9, 1.4]}},
                      roofs={"kyoto": {"pitch_deg": [36, 42], "eaves": 0.9, "strips": 4}}, balconies=None),
         fracture=dict(_FRACTURE)),
+    # free-form structures (bridges, towers, statues): the `sculpt` node slices CSG primitives
+    # into layers and adds its own ground slab; the 1x1 blockout is only a placeholder.
+    "structure": dict(
+        global_=dict(floor_height=4.0),
+        blockout=[dict(footprint=[[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]], floors=1)],
+        nodes=[{"sculpt": {"layer": 0.5, "ground": {"pad": 3.0}}}],
+        fracture=dict(_FRACTURE, concrete={"cell_size": 1.6}, brick={"cell_size": 1.4},
+                      metal={"cell_size": 1.4})),
 }
 
 

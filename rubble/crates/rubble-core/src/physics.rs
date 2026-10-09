@@ -13,6 +13,17 @@ use rapier3d::prelude::*;
 
 pub type Shape = SharedShape;
 
+/// Collision group of light debris (see `PhysicsBackend::set_light_debris`).
+const LIGHT_DEBRIS: Group = Group::GROUP_2;
+
+/// Parts of a dynamic compound (identity sub-poses) with per-part data the caller has cached:
+/// `aabbs[i] == shapes[i].compute_aabb(&Pose::IDENTITY)`, `ccd[i] == shapes[i].ccd_thickness()`.
+pub struct CompoundParts {
+    pub shapes: Vec<Shape>,
+    pub aabbs: Vec<Aabb>,
+    pub ccd: Vec<f32>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct BodyId(pub(crate) RigidBodyHandle);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -65,14 +76,18 @@ pub trait PhysicsBackend {
     fn convex_hull(points: &[Vec3]) -> Option<Shape>
     where
         Self: Sized;
-    fn add_static_collider(&mut self, shape: Shape, pose: Pose, tag: u128) -> ColliderId;
+    /// Returns the collider and its world AABB (what `collider_aabb` would return).
+    fn add_static_collider(&mut self, shape: Shape, pose: Pose, tag: u128) -> (ColliderId, (Vec3, Vec3));
     fn add_ground_plane(&mut self, z: f32, tag: u128) -> ColliderId;
     fn remove_collider(&mut self, c: ColliderId);
     fn add_dynamic_compound(
-        &mut self, pose: Pose, parts: &[Shape], mass: &MassProps, linvel: Vec3, angvel: Vec3, tag: u128,
+        &mut self, pose: Pose, parts: CompoundParts, mass: &MassProps, linvel: Vec3, angvel: Vec3, tag: u128,
     ) -> (BodyId, ColliderId);
+    /// Light debris: the collider still hits everything else, but not other light debris
+    /// (piles of small bits are the expensive part of a collapse). Kept across `set_dynamic_compound`.
+    fn set_light_debris(&mut self, col: ColliderId, on: bool);
     /// Replace the body's compound shape and mass; returns the (possibly new) collider id.
-    fn set_dynamic_compound(&mut self, body: BodyId, col: ColliderId, parts: &[Shape], mass: &MassProps) -> ColliderId;
+    fn set_dynamic_compound(&mut self, body: BodyId, col: ColliderId, parts: CompoundParts, mass: &MassProps) -> ColliderId;
     fn remove_body(&mut self, b: BodyId);
     fn body_state(&self, b: BodyId) -> BodyState;
     fn set_body_velocity(&mut self, b: BodyId, linvel: Vec3, angvel: Vec3);
@@ -95,6 +110,11 @@ pub trait PhysicsBackend {
     /// Wake every dynamic body with a collider whose AABB intersects the box. Removing a
     /// support never wakes what sleeps on it, so callers do this after removing geometry.
     fn wake_bodies_in_aabb(&mut self, min: Vec3, max: Vec3);
+    /// Does any collider found by `query_aabb(min, max)` belong to a sleeping dynamic body
+    /// (when `sleeping`), or have a tag accepted by `tag_pred`?
+    fn aabb_touches(&self, min: Vec3, max: Vec3, sleeping: bool, tag_pred: &dyn Fn(u128) -> bool) -> bool;
+    /// `wake_bodies_in_aabb` followed by `query_aabb` on the same box, in one traversal.
+    fn wake_and_query_aabb(&mut self, min: Vec3, max: Vec3, out: &mut Vec<(ColliderId, u128)>);
     /// True if the body has an active contact with another dynamic body that is still moving
     /// (awake and faster than the given rest thresholds).
     fn touches_moving_dynamic(&self, b: BodyId, rest_lin: f32, rest_ang: f32) -> bool;
@@ -106,6 +126,9 @@ pub trait PhysicsBackend {
 
 pub struct RapierBackend {
     pub world: PhysicsWorld,
+    /// rayon pool the step runs in (None: the caller's / global pool)
+    pool: Option<&'static rayon::ThreadPool>,
+    scratch_parents: Vec<RigidBodyHandle>,
 }
 
 impl RapierBackend {
@@ -114,12 +137,28 @@ impl RapierBackend {
         world.gravity = gravity;
         // keep per-sub-shape manifolds so impacts map to chunks without a spatial search
         world.integration_parameters.contact_clustering = false;
-        RapierBackend { world }
+        RapierBackend { world, pool: None, scratch_parents: Vec::new() }
     }
 }
 
 fn hit_from(world: &PhysicsWorld, h: ColliderHandle, toi: f32, normal: Vec3) -> RayHit {
     RayHit { collider: ColliderId(h), tag: world.colliders[h].user_data, toi, normal }
+}
+
+impl RapierBackend {
+    /// Run the rigid-body step on a dedicated pool of `n` threads (0 = auto, see
+    /// `WorldConfig::physics_threads`). Results are identical for any thread count.
+    pub fn set_threads(&mut self, n: usize) {
+        let n = if n > 0 {
+            n
+        } else if let Some(e) = std::env::var("RUBBLE_PHYSICS_THREADS").ok().and_then(|v| v.parse::<usize>().ok()) {
+            e
+        } else {
+            let cores = std::thread::available_parallelism().map_or(1, |c| c.get());
+            (cores / 2).clamp(1, 6)
+        };
+        self.pool = Some(physics_pool(n));
+    }
 }
 
 impl PhysicsBackend for RapierBackend {
@@ -139,7 +178,7 @@ impl PhysicsBackend for RapierBackend {
         SharedShape::convex_hull(points)
     }
 
-    fn add_static_collider(&mut self, shape: Shape, pose: Pose, tag: u128) -> ColliderId {
+    fn add_static_collider(&mut self, shape: Shape, pose: Pose, tag: u128) -> (ColliderId, (Vec3, Vec3)) {
         // Parent-less colliders behave as fixed geometry and are O(1) to remove
         // (a fixed body with thousands of children has O(n) child removal).
         let c = ColliderBuilder::new(shape).position(pose).user_data(tag).friction(0.8).density(0.0).build();
@@ -147,7 +186,7 @@ impl PhysicsBackend for RapierBackend {
         let h = self.world.colliders.insert(c);
         // make it visible to scene queries immediately (before the next step)
         self.world.broad_phase.set_aabb(&self.world.integration_parameters, h, aabb);
-        ColliderId(h)
+        (ColliderId(h), (aabb.mins, aabb.maxs))
     }
 
     fn add_ground_plane(&mut self, z: f32, tag: u128) -> ColliderId {
@@ -164,11 +203,13 @@ impl PhysicsBackend for RapierBackend {
 
     fn remove_collider(&mut self, c: ColliderId) {
         let w = &mut self.world;
-        w.colliders.remove(c.0, &mut w.islands, &mut w.bodies, &mut w.soft_bodies, true);
+        if let Some(col) = w.colliders.remove(c.0, &mut w.islands, &mut w.bodies, &mut w.soft_bodies, true) {
+            drop_in_background(col);
+        }
     }
 
     fn add_dynamic_compound(
-        &mut self, pose: Pose, parts: &[Shape], mass: &MassProps, linvel: Vec3, angvel: Vec3, tag: u128,
+        &mut self, pose: Pose, parts: CompoundParts, mass: &MassProps, linvel: Vec3, angvel: Vec3, tag: u128,
     ) -> (BodyId, ColliderId) {
         let mp = MassProperties::with_inertia_matrix(mass.local_com, mass.mass, mass.inertia);
         let rb = RigidBodyBuilder::dynamic()
@@ -184,18 +225,35 @@ impl PhysicsBackend for RapierBackend {
         (BodyId(b), ColliderId(c))
     }
 
-    fn set_dynamic_compound(&mut self, body: BodyId, col: ColliderId, parts: &[Shape], mass: &MassProps) -> ColliderId {
+    fn set_dynamic_compound(&mut self, body: BodyId, col: ColliderId, parts: CompoundParts, mass: &MassProps) -> ColliderId {
         // NOTE: `Collider::set_shape` on a collider with live contacts trips rapier 0.36's
         // solver-graph validation (stale contact entries), so swap the collider instead.
-        let tag = self.world.colliders.get(col.0).map(|c| c.user_data).unwrap_or(0);
+        let (tag, groups) =
+            self.world.colliders.get(col.0).map(|c| (c.user_data, c.collision_groups())).unwrap_or((0, InteractionGroups::all()));
         self.remove_collider(col);
-        let c = ColliderBuilder::new(compound_of(parts)).density(0.0).friction(0.8).restitution(0.0).user_data(tag).build();
+        let c = ColliderBuilder::new(compound_of(parts))
+            .density(0.0)
+            .friction(0.8)
+            .restitution(0.0)
+            .user_data(tag)
+            .collision_groups(groups)
+            .build();
         let h = self.world.insert_collider(c, Some(body.0));
         if let Some(b) = self.world.bodies.get_mut(body.0) {
             let mp = MassProperties::with_inertia_matrix(mass.local_com, mass.mass, mass.inertia);
             b.set_additional_mass_properties(mp, true);
         }
         ColliderId(h)
+    }
+
+    fn set_light_debris(&mut self, col: ColliderId, on: bool) {
+        if let Some(c) = self.world.colliders.get_mut(col.0) {
+            c.set_collision_groups(if on {
+                InteractionGroups::new(LIGHT_DEBRIS, !LIGHT_DEBRIS, InteractionTestMode::And)
+            } else {
+                InteractionGroups::all()
+            });
+        }
     }
 
     fn remove_body(&mut self, b: BodyId) {
@@ -228,7 +286,13 @@ impl PhysicsBackend for RapierBackend {
 
     fn step(&mut self, dt: f32) {
         self.world.integration_parameters.dt = dt;
-        self.world.step();
+        // Handing the step to the pool costs a cross-thread round trip (~20 µs): not worth it
+        // when nothing moves (results do not depend on where the step runs).
+        let idle = self.world.islands.num_active_bodies() == 0;
+        match self.pool {
+            Some(pool) if !idle => pool.install(|| self.world.step()),
+            _ => self.world.step(),
+        }
     }
 
     fn sync_queries(&mut self) {
@@ -280,11 +344,15 @@ impl PhysicsBackend for RapierBackend {
         let w = &self.world;
         for pair in w.narrow_phase.contact_pairs() {
             let Some(rigid) = pair.rigid() else { continue };
+            let clustered = !rigid.solver_clusters.is_empty();
+            let manifolds: &[ContactManifold] = if clustered { &rigid.solver_clusters } else { &rigid.manifolds };
+            // most pairs carry no impulse above the threshold: skip them before any lookup
+            if !manifolds.iter().any(|m| m.points.iter().any(|p| p.data.impulse > min_impulse)) {
+                continue;
+            }
             let (Some(c1), Some(c2)) = (w.colliders.get(pair.collider1), w.colliders.get(pair.collider2)) else {
                 continue;
             };
-            let clustered = !rigid.solver_clusters.is_empty();
-            let manifolds: &[ContactManifold] = if clustered { &rigid.solver_clusters } else { &rigid.manifolds };
             for m in manifolds {
                 let n = c1.position().transform_vector(m.local_n1);
                 for p in &m.points {
@@ -341,6 +409,35 @@ impl PhysicsBackend for RapierBackend {
         }
     }
 
+    fn aabb_touches(&self, min: Vec3, max: Vec3, sleeping: bool, tag_pred: &dyn Fn(u128) -> bool) -> bool {
+        let w = &self.world;
+        w.intersect_aabb_conservative(Aabb::new(min, max), QueryFilter::default()).any(|(_, c)| {
+            tag_pred(c.user_data)
+                || (sleeping
+                    && c.parent().and_then(|p| w.bodies.get(p)).is_some_and(|rb| rb.is_dynamic() && rb.is_sleeping()))
+        })
+    }
+
+    fn wake_and_query_aabb(&mut self, min: Vec3, max: Vec3, out: &mut Vec<(ColliderId, u128)>) {
+        let aabb = Aabb::new(min, max);
+        let mut parents = std::mem::take(&mut self.scratch_parents);
+        parents.clear();
+        for (h, c) in self.world.intersect_aabb_conservative(aabb, QueryFilter::default()) {
+            if let Some(p) = c.parent() {
+                parents.push(p);
+            }
+            out.push((ColliderId(h), c.user_data));
+        }
+        for &p in &parents {
+            if let Some(rb) = self.world.bodies.get_mut(p) {
+                if rb.is_dynamic() && rb.is_sleeping() {
+                    rb.wake_up(true);
+                }
+            }
+        }
+        self.scratch_parents = parents;
+    }
+
     fn touches_moving_dynamic(&self, b: BodyId, rest_lin: f32, rest_ang: f32) -> bool {
         let w = &self.world;
         let Some(rb) = w.bodies.get(b.0) else { return false };
@@ -380,9 +477,61 @@ impl PhysicsBackend for RapierBackend {
     }
 }
 
-fn compound_of(parts: &[Shape]) -> SharedShape {
-    if parts.len() == 1 {
-        return parts[0].clone();
+fn compound_of(mut parts: CompoundParts) -> SharedShape {
+    debug_assert!(parts.shapes.len() == parts.aabbs.len() && parts.shapes.len() == parts.ccd.len());
+    if parts.shapes.len() == 1 {
+        return parts.shapes.pop().unwrap();
     }
-    SharedShape::compound(parts.iter().map(|s| (Pose::IDENTITY, s.clone())).collect())
+    // same compound as `SharedShape::compound` (identity sub-poses), minus recomputing the
+    // per-part AABBs and CCD thicknesses (`Compound::ccd_thickness` folds the same min)
+    let ccd = parts.ccd.iter().fold(f32::MAX, |c, &t| c.min(t));
+    let shapes = parts.shapes.into_iter().map(|s| (Pose::IDENTITY, s)).collect();
+    SharedShape::new(rapier3d::parry::shape::Compound::new_with_part_data(shapes, parts.aabbs, Some(ccd)))
+}
+
+/// Process-wide rayon pool with `n` threads (created on first use, shared by all worlds).
+fn physics_pool(n: usize) -> &'static rayon::ThreadPool {
+    static POOLS: std::sync::Mutex<Vec<(usize, &'static rayon::ThreadPool)>> = std::sync::Mutex::new(Vec::new());
+    let mut pools = POOLS.lock().unwrap();
+    if let Some(&(_, p)) = pools.iter().find(|(k, _)| *k == n) {
+        return p;
+    }
+    let p: &'static rayon::ThreadPool = Box::leak(Box::new(
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(n)
+            .thread_name(|i| format!("rubble-physics-{i}"))
+            .build()
+            .expect("physics thread pool"),
+    ));
+    pools.push((n, p));
+    p
+}
+
+/// Compounds at least this big are dropped on a background thread.
+const BACKGROUND_DROP_PARTS: usize = 1024;
+
+/// Dropping a big compound releases one `Arc` per part (cache-missing atomic decrements, and
+/// the part shapes are still shared with the building, so nothing is actually freed but the
+/// compound's own buffers). Hand big ones to a background thread instead of blocking the tick.
+fn drop_in_background(col: Collider) {
+    let big = col.shape().as_compound().is_some_and(|c| c.shapes().len() >= BACKGROUND_DROP_PARTS);
+    if !big {
+        return;
+    }
+    static DROPPER: std::sync::OnceLock<std::sync::Mutex<std::sync::mpsc::Sender<Collider>>> = std::sync::OnceLock::new();
+    let tx = DROPPER.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<Collider>();
+        std::thread::Builder::new()
+            .name("rubble-dropper".into())
+            .spawn(move || {
+                for c in rx {
+                    drop(c);
+                }
+            })
+            .expect("spawn dropper thread");
+        std::sync::Mutex::new(tx)
+    });
+    if let Err(e) = tx.lock().unwrap().send(col) {
+        drop(e.0);
+    }
 }

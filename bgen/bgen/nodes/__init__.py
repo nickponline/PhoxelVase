@@ -13,7 +13,7 @@ from types import ModuleType
 NODE_MODULES = {
     "floors": "floors", "exterior_walls": "exterior_walls", "columns": "columns",
     "rooms": "rooms", "stairs": "stairs", "openings": "openings", "roofs": "roofs",
-    "balconies": "balconies", "manual": "manual",
+    "balconies": "balconies", "manual": "manual", "sculpt": "sculpt",
 }
 
 

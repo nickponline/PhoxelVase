@@ -14,6 +14,9 @@ pub enum BreakCause {
     Damage,
     Stress,
     Impact,
+    /// lost support: the group above the joint has its centre of mass outside its support, or
+    /// the chunk was left hanging by slivers
+    Tipping,
 }
 
 #[derive(Clone, Debug, Serialize)]

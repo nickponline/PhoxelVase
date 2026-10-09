@@ -1,0 +1,18 @@
+# GENERATED variant of ../tower.yaml: fracture cell_size x2.5 (xcoarse: fewer, larger chunks).
+# Same layout as the base spec for a given seed; only the fracture differs.
+name: tower_xcoarse
+preset: tower
+seed: 11
+blockout:
+  shape: [rect, podium]
+  width: [20, 30]
+  depth: [18, 24]
+  floors: [8, 15]
+fracture:
+  concrete: {cell_size: 4.5}
+  brick: {cell_size: 3.5}
+  wood:
+    cell_size: 1.75
+    anisotropy: [3, 1]
+  metal: {cell_size: 3.0}
+  glass: {mode: shatter_on_hit}

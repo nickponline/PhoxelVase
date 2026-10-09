@@ -1,0 +1,25 @@
+# GENERATED variant of ../aqueduct.yaml: fracture cell_size x2.5 (xcoarse: fewer, larger chunks).
+# Same layout as the base spec for a given seed; only the fracture differs.
+name: aqueduct_xcoarse
+preset: structure
+seed: 1
+nodes:
+- sculpt:
+    template: aqueduct
+    layer: 0.5
+    arches: [4, 6]
+    bay: [16.0, 20.0]
+    pier: [3.5, 4.5]
+    tier1: [16.0, 20.0]
+    tier2: [12.0, 15.0]
+    tier3: [5.0, 7.0]
+    ground: {pad: 4.0}
+fracture:
+  concrete: {cell_size: 4.0}
+  brick: {cell_size: 4.5}
+  wood:
+    cell_size: 1.75
+    anisotropy: [3, 1]
+  metal: {cell_size: 3.5}
+  glass: {mode: shatter_on_hit}
+stability: {accept_util: 0.8, max_rounds: 12}

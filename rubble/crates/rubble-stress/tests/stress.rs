@@ -23,7 +23,7 @@ fn column_flow_equals_weight_above() {
         let f = -st.edge_flow(&g, e);
         assert!(close(f, above, 1e-3), "edge {e}: flow {f} vs {above}");
         // downward load through a vertical contact is bearing: capacity × compression_factor
-        assert!(close(r.utilization[e as usize] as f64, above / 1000.0, 1e-3));
+        assert!(close(r.utilization[e as usize] as f64, above / 350.0, 1e-3));
     }
 }
 
@@ -42,12 +42,12 @@ fn two_columns_split_load_evenly() {
 
 #[test]
 fn table_leg_removal_hysteresis() {
-    // 3x3 slab, weight 1 each => 9 N; legs cap 0.5 (×10 in compression) => 2.25/5 = 0.45
-    // intact, 9/5 = 1.8 on one leg
-    let tb = table(3, 2, 1.0, 1000.0, 0.5);
+    // 3x3 slab, weight 1 each => 9 N; legs cap 1/0.7 (×3.5 in compression = 5) => 2.25/5 =
+    // 0.45 intact, 9/5 = 1.8 on one leg (axial; bearing sections off, see tipping test)
+    let tb = table(3, 2, 1.0, 1000.0, 1.0 / 0.7);
     let mut t = tb.g.clone();
     let g = t.graph();
-    let cfg = StressConfig { hold_time: 0.25, ..Default::default() };
+    let cfg = StressConfig { hold_time: 0.25, bearing_sections: false, ..Default::default() };
     let dt = 1.0 / 60.0;
     let mut st = StressState::new(&g);
     let mut r = solve_step(&g, &mut st, &t.input(), &cfg, dt);
@@ -245,7 +245,7 @@ fn static_report_finds_unsupported() {
     assert_eq!(rep.unsupported_nodes, (5..=10).collect::<Vec<u32>>());
     assert!(close(rep.total_load, 4.0, 1e-9));
     assert!(close(rep.anchor_flow, 4.0, 1e-3));
-    assert!((rep.max_util - 0.004).abs() < 1e-5);
+    assert!((rep.max_util - 4.0 / 350.0).abs() < 1e-5);
     assert_eq!(rep.worst_edges[0].0, 0);
 
     // incremental path detects the same thing
@@ -258,7 +258,7 @@ fn static_report_finds_unsupported() {
         assert!(!st.is_supported(i));
     }
     assert!(r.utilization[5..].iter().all(|&u| u == 0.0));
-    assert!((r.utilization[0] - 0.004).abs() < 1e-5);
+    assert!((r.utilization[0] - 4.0 / 350.0).abs() < 1e-5);
 }
 
 #[test]
@@ -343,4 +343,94 @@ fn uniform_wall_has_no_bending() {
         }
     }
     assert!(r.utilization.iter().all(|&u| u < 0.05));
+}
+
+#[test]
+fn catchup_solves_big_support_loss_in_one_call() {
+    // 20×20×12 lattice (4800 nodes): cut half of the ground layer's bonds in one tick
+    let mut t = grid_building(20, 20, 12, 1.0, 1000.0);
+    let g = t.graph();
+    let cfg = StressConfig { max_iters: 10, ..Default::default() };
+    let mut st = StressState::new(&g);
+    for _ in 0..200 {
+        if solve_step(&g, &mut st, &t.input(), &StressConfig { max_iters: 1000, ..cfg.clone() }, 0.0).converged {
+            break;
+        }
+    }
+    for e in 0..t.n_edges() {
+        let (a, b) = t.edges[e];
+        let (pa, pb) = (t.node_pos[a as usize], t.node_pos[b as usize]);
+        if pa[2].min(pb[2]) == 0.0 && pa[2] != pb[2] && pa[0] < 10.0 {
+            t.edge_alive[e] = false;
+        }
+    }
+    let r = solve_step(&g, &mut st, &t.input(), &cfg, 0.0);
+    assert!(r.converged && r.iters > cfg.max_iters, "catch-up should run to convergence: {} iters", r.iters);
+    let mut st_off = StressState::new(&g);
+    let off = StressConfig { catchup_frac: 0.0, ..cfg.clone() };
+    let t0 = grid_building(20, 20, 12, 1.0, 1000.0);
+    for _ in 0..200 {
+        if solve_step(&g, &mut st_off, &t0.input(), &StressConfig { max_iters: 1000, ..off.clone() }, 0.0).converged {
+            break;
+        }
+    }
+    let r_off = solve_step(&g, &mut st_off, &t.input(), &off, 0.0);
+    assert!(!r_off.converged && r_off.iters <= cfg.max_iters);
+}
+
+#[test]
+fn damage_scales_capacity() {
+    let mut t = column(4, 1.0, 100.0);
+    let g = t.graph();
+    let cfg = cfg_full();
+    let mut st = StressState::new(&g);
+    let u0 = solve_step(&g, &mut st, &t.input(), &cfg, 0.0).utilization[0];
+    t.set_strength(1, 0.25);
+    let r = solve_step(&g, &mut st, &t.input(), &cfg, 0.0);
+    assert!((r.utilization[0] / u0 - 4.0).abs() < 1e-3 && (r.utilization[1] / u0 * 4.0 / 3.0 * 0.25 - 1.0).abs() < 1e-2);
+    assert!((r.utilization[2] - solve_step(&g, &mut StressState::new(&g), &column(4, 1.0, 100.0).input(), &cfg, 0.0).utilization[2]).abs() < 1e-6);
+}
+
+#[test]
+fn buckling_factor_follows_unbraced_length() {
+    // 6 stacked 0.3 m column chunks from an anchor, a side "slab" bracing node at mid height
+    let mut t = column(6, 1.0, 100.0);
+    for i in 1..=6 {
+        t.set_column(i, 0.3);
+    }
+    let top = t.add_node([0.0, 0.0, 7.0], 5.0, false); // a slab on top braces the head
+    t.add_edge(6, top, 100.0, 1.0);
+    let anchor2 = t.add_node([2.0, 0.0, 0.0], 0.0, true);
+    let brace = t.add_node([1.0, 0.0, 3.0], 0.0, false);
+    t.add_edge(anchor2, brace, 100.0, 1.0);
+    let be = t.add_edge(brace, 3, 100.0, 0.04);
+    let g = t.graph();
+    let cfg = cfg_full();
+    let mut st = StressState::new(&g);
+    solve_step(&g, &mut st, &t.input(), &cfg, 0.0);
+    let braced = st.buckling_factor(2);
+    t.edge_alive[be as usize] = false;
+    solve_step(&g, &mut st, &t.input(), &cfg, 0.0);
+    let unbraced = st.buckling_factor(2);
+    println!("phi braced {braced:.3} unbraced {unbraced:.3}");
+    assert!(unbraced < 0.55 * braced && unbraced > 0.15 * braced);
+}
+
+#[test]
+fn one_legged_table_tips() {
+    // remaining leg carries the slab whose centroid is 1.4 m off its axis: the far side of
+    // its top joint goes into tension and dominates
+    let tb = table(3, 2, 1.0, 1000.0, 10.0);
+    let mut t = tb.g.clone();
+    for leg in &tb.legs[0..3] {
+        for &i in leg {
+            t.node_alive[i as usize] = false;
+        }
+    }
+    let g = t.graph();
+    let on = static_report(&g, &t.input(), &cfg_full());
+    let off = static_report(&g, &t.input(), &StressConfig { bearing_sections: false, ..cfg_full() });
+    let e = tb.leg_top_edges[3] as usize;
+    println!("one leg: bearing {:.3} axial {:.3}", on.utilization[e], off.utilization[e]);
+    assert!(on.utilization[e] > 5.0 * off.utilization[e]);
 }

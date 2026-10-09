@@ -29,6 +29,8 @@ pub struct SBox {
     pub max: [f32; 3],
     pub material: u16,
     pub flags: u16,
+    /// element id (0 = the default "other" element)
+    pub elem: u32,
 }
 
 /// Builds a `Bld` from axis-aligned boxes. Edges are created between boxes sharing a face
@@ -40,16 +42,41 @@ pub struct SynthBuilder {
     pub min_contact: f32,
     /// boxes whose min z <= this are anchors
     pub anchor_z: f32,
+    /// element kinds (bgen ELEMENT_KINDS ids); element 0 is the default "other" (14)
+    pub elem_kinds: Vec<u16>,
+    /// element assigned to boxes added from now on (see [`SynthBuilder::begin_element`])
+    pub cur_elem: u32,
 }
 
 impl SynthBuilder {
     pub fn new(name: &str) -> Self {
-        SynthBuilder { name: name.into(), boxes: vec![], materials: default_materials(), min_contact: 0.01, anchor_z: 1e-4 }
+        SynthBuilder {
+            name: name.into(),
+            boxes: vec![],
+            materials: default_materials(),
+            min_contact: 0.01,
+            anchor_z: 1e-4,
+            elem_kinds: vec![14],
+            cur_elem: 0,
+        }
     }
 
     pub fn add(&mut self, min: [f32; 3], max: [f32; 3], material: u16, flags: u16) -> u32 {
-        self.boxes.push(SBox { min, max, material, flags });
+        self.boxes.push(SBox { min, max, material, flags, elem: self.cur_elem });
         self.boxes.len() as u32 - 1
+    }
+
+    /// Start a new element (member) of the given kind (e.g. 2 floor, 3 column); boxes added
+    /// until the next `begin_element`/`end_element` belong to it. Returns its id.
+    pub fn begin_element(&mut self, kind: u16) -> u32 {
+        self.elem_kinds.push(kind);
+        self.cur_elem = (self.elem_kinds.len() - 1) as u32;
+        self.cur_elem
+    }
+
+    /// Back to the default element 0.
+    pub fn end_element(&mut self) {
+        self.cur_elem = 0;
     }
 
     /// Fill a box region with a grid of `n` cells.
@@ -106,7 +133,7 @@ impl SynthBuilder {
                 [0.0, 0.0, 1.0, -b.max[2]],
             ]);
             chunks.push(ChunkRecord {
-                elem: 0,
+                elem: b.elem,
                 material: b.material,
                 flags,
                 mass,
@@ -130,17 +157,25 @@ impl SynthBuilder {
         frame[5] = 1.0;
         frame[10] = 1.0;
         frame[15] = 1.0;
-        let elements = vec![ElemRecord {
-            id: 0,
-            kind: 14,
-            material: 0,
-            floor: 0,
-            flags: 0,
-            first_chunk: 0,
-            chunk_count: n as u32,
-            frame,
-            thickness: 1.0,
-        }];
+        let elements: Vec<ElemRecord> = self
+            .elem_kinds
+            .iter()
+            .enumerate()
+            .map(|(id, &kind)| {
+                let mine: Vec<usize> = (0..n).filter(|&i| self.boxes[i].elem == id as u32).collect();
+                ElemRecord {
+                    id: id as u32,
+                    kind,
+                    material: 0,
+                    floor: 0,
+                    flags: 0,
+                    first_chunk: mine.first().copied().unwrap_or(0) as u32,
+                    chunk_count: mine.len() as u32,
+                    frame,
+                    thickness: 1.0,
+                }
+            })
+            .collect();
         Bld {
             meta: serde_json::json!({"name": self.name, "materials": self.materials, "synthetic": true}),
             materials: self.materials.clone(),

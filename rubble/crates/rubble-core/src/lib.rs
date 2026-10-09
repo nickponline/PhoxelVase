@@ -17,6 +17,6 @@ pub use building::{Building, ChunkState};
 pub use config::{Explosion, Projectile, ProjectileKind, StressSettings, Weapon, WeaponParams, WorldConfig};
 pub use events::{BreakCause, BuildingId, ClusterId, Event};
 pub use math::{pose_to_rowmajor, Isometry, Pose, Vec3};
-pub use world::{BuildingState, Cluster, LoadError, Stats, StepTimings, World};
+pub use world::{BuildingState, Cluster, FloatingGroup, FloatingReport, LoadError, Stats, StepTimings, World};
 pub use rapier3d;
 pub use rubble_format;

@@ -6,12 +6,53 @@ use crate::math::*;
 use crate::physics::*;
 use rayon::prelude::*;
 use rubble_format::{Bld, BldError, F_NO_DEBRIS};
-use rubble_stress::{solve_step, StressConfig, StressInput};
+use rubble_stress::{solve_step_lean, StressConfig, StressInput};
 use slotmap::{Key, KeyData, SlotMap};
 use std::path::Path;
 use std::time::Instant;
 
 const KIND_CHUNK: u128 = 1;
+/// What holds a piece of rubble up (see `World::rests_on_something`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Support {
+    /// nothing underneath
+    None,
+    /// only things that may move away: dynamic bodies, chunks waiting to collapse
+    Transient,
+    /// the ground, the static building or frozen rubble
+    Solid,
+}
+
+/// Rubble with nothing under it (see `World::floating_report`).
+#[derive(Clone, Debug)]
+pub struct FloatingGroup {
+    pub building: BuildingId,
+    pub chunks: Vec<u32>,
+    /// lowest chunk centre of mass (world z)
+    pub min_com_z: f32,
+    /// colliders outside the group it touches where it is (0: really in mid-air; otherwise it
+    /// is wedged between things beside it, held by friction)
+    pub touching: usize,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct FloatingReport {
+    /// frozen (static) rubble groups with no support
+    pub frozen: Vec<FloatingGroup>,
+    /// resting dynamic clusters with no support (e.g. asleep in mid-air)
+    pub clusters: Vec<(ClusterId, FloatingGroup)>,
+}
+
+impl FloatingReport {
+    pub fn is_empty(&self) -> bool {
+        self.frozen.is_empty() && self.clusters.is_empty()
+    }
+}
+
+/// Smallest group of support-lost boxes pre-tested together (see `thaw_unsupported`).
+const THAW_BOX_GROUP: usize = 16;
+/// Row count from which background impact solves run their CG kernels on rayon.
+const IMPACT_PAR_THRESHOLD: usize = 4096;
 const KIND_CLUSTER: u128 = 2;
 const KIND_GROUND: u128 = 3;
 
@@ -60,6 +101,12 @@ pub struct Cluster {
     pub last_impact: f32,
     /// accumulated landing velocity change (decays over `impact_window`)
     pub impact_dv: Vec3,
+    /// internal edges broken since the last rebuild (lets a rebuild prove "still one piece"
+    /// without walking the whole cluster)
+    pub broken: Vec<u32>,
+    /// known to be one connected piece (set by a full rebuild; a new cluster may not be, e.g.
+    /// after its glass shattered)
+    pub connected: bool,
 }
 
 struct ImpactResult {
@@ -90,25 +137,45 @@ struct ImpactJob {
     debug: Option<String>,
 }
 
+/// `RUBBLE_DEBUG_IMPACT` is set (read once; the environment lookup takes a lock).
+fn debug_impact() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("RUBBLE_DEBUG_IMPACT").is_ok())
+}
+
+/// Workers for background impact solves (persistent: no thread spawn per job). A dedicated
+/// pool keeps them off the global rayon pool, which the physics step uses.
+fn impact_pool() -> &'static rayon::ThreadPool {
+    static POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| rayon::ThreadPoolBuilder::new().num_threads(4).thread_name(|i| format!("rubble-impact-{i}")).build().unwrap())
+}
+
 fn run_impact_job(mut j: ImpactJob) -> ImpactResult {
     let t0 = Instant::now();
     let mut broken: Vec<u32> = vec![];
     let mut st = rubble_stress::StressState::new(&j.graph);
     for round in 0..j.rounds {
-        let input = StressInput { node_weight: &j.weight, node_alive: &j.alive, anchor: &j.anchor, edge_alive: &j.edge_alive };
-        let mut r = solve_step(&j.graph, &mut st, &input, &j.scfg, 0.0);
+        let input = StressInput {
+            node_weight: &j.weight,
+            node_alive: &j.alive,
+            anchor: &j.anchor,
+            edge_alive: &j.edge_alive,
+            ..Default::default()
+        };
+        let mut r = solve_step_lean(&j.graph, &mut st, &input, &j.scfg, 0.0);
         for _ in 0..2 {
             if r.converged {
                 break;
             }
-            r = solve_step(&j.graph, &mut st, &input, &j.scfg, 0.0);
+            r = solve_step_lean(&j.graph, &mut st, &input, &j.scfg, 0.0);
         }
+        let util = st.utilization();
         let mut over: Vec<(f32, u32)> = j
             .edges
             .iter()
             .filter(|&&e| j.edge_alive[e as usize])
             .filter_map(|&e| {
-                let u = r.utilization[e as usize] / if j.inter_panel[e as usize] { j.joint } else { 1.0 };
+                let u = util[e as usize] / if j.inter_panel[e as usize] { j.joint } else { 1.0 };
                 (u > 1.0).then_some((u, e))
             })
             .collect();
@@ -179,6 +246,9 @@ pub struct Stats {
     pub stress_iters: usize,
     /// chunks in the largest dynamic cluster
     pub largest_cluster: usize,
+    /// chunks the full ground check had to send down because the incremental search missed
+    /// them (should stay 0; anything else is a bug worth reporting)
+    pub ground_check_catches: usize,
 }
 
 /// Debug/inspection view of a building.
@@ -192,12 +262,26 @@ pub struct BuildingState {
     pub utilization: Vec<f32>,
 }
 
+/// A queued cutting beam, see [`World::beam`].
+#[derive(Clone, Copy, Debug)]
+struct Beam {
+    o: Vec3,
+    /// unit direction
+    d: Vec3,
+    range: f32,
+    radius: f32,
+    dmg: f32,
+    imp: f32,
+}
+
 pub struct World {
     pub cfg: WorldConfig,
     pub phys: RapierBackend,
     pub buildings: Vec<Building>,
     pub clusters: SlotMap<ClusterKey, Cluster>,
     projectiles: Vec<Projectile>,
+    /// queued beams
+    beams: Vec<Beam>,
     explosions: Vec<Explosion>,
     damage: Vec<(u32, u32, f32)>,
     edge_damage: Vec<(u32, u32, f32)>,
@@ -214,8 +298,26 @@ pub struct World {
     support_lost: Vec<(Vec3, Vec3)>,
     /// round-robin cursor (building, chunk) of the frozen-support sweep
     sweep_cursor: (usize, usize),
+    /// frozen groups (building, any chunk) resting on something that may move away (a dynamic
+    /// body, a collapsing piece): re-checked every tick until their support is solid
+    support_watch: Vec<(u32, u32)>,
+    ground_check_catches: usize,
     // scratch
     contacts: Vec<ContactImpulse>,
+    scratch_u32: Vec<u32>,
+    scratch_hits: Vec<(ClusterKey, u32, Vec3)>,
+}
+
+/// Interleave the low 10 bits of x, y, z (Morton order).
+fn morton3(x: u32, y: u32, z: u32) -> u32 {
+    fn spread(mut v: u32) -> u32 {
+        v &= 0x3ff;
+        v = (v | (v << 16)) & 0x0300_00ff;
+        v = (v | (v << 8)) & 0x0300_f00f;
+        v = (v | (v << 4)) & 0x030c_30c3;
+        (v | (v << 2)) & 0x0924_9249
+    }
+    spread(x) | (spread(y) << 1) | (spread(z) << 2)
 }
 
 pub(crate) fn bits_of(v: impl Iterator<Item = bool>, n: usize) -> Vec<u64> {
@@ -233,6 +335,7 @@ impl World {
         let mut phys = RapierBackend::new(v3(cfg.gravity));
         phys.set_ccd(cfg.ccd);
         phys.set_solver_iterations(cfg.solver_iterations);
+        phys.set_threads(cfg.physics_threads);
         let stress_iters = cfg.stress.max_iters;
         World {
             cfg,
@@ -240,6 +343,7 @@ impl World {
             buildings: vec![],
             clusters: SlotMap::with_key(),
             projectiles: vec![],
+            beams: vec![],
             explosions: vec![],
             damage: vec![],
             edge_damage: vec![],
@@ -254,7 +358,11 @@ impl World {
             last_dt: 1.0 / 60.0,
             support_lost: vec![],
             sweep_cursor: (0, 0),
+            support_watch: vec![],
+            ground_check_catches: 0,
             contacts: vec![],
+            scratch_u32: vec![],
+            scratch_hits: vec![],
         }
     }
 
@@ -271,8 +379,9 @@ impl World {
         let mut b = Building::new(bld, pose, self.cfg.edge_health_per_newton, g);
         let bi = self.buildings.len() as u32;
         for c in 0..b.n_chunks() {
-            let h = self.phys.add_static_collider(b.shapes[c].clone(), pose, chunk_tag(bi, c as u32));
+            let (h, aabb) = self.phys.add_static_collider(b.shapes[c].clone(), pose, chunk_tag(bi, c as u32));
             b.collider[c] = Some(h);
+            b.collider_aabb[c] = aabb;
         }
         // full connectivity check once at load
         b.dirty = (0..b.n_chunks() as u32).collect();
@@ -306,11 +415,29 @@ impl World {
     pub fn fire(&mut self, p: Projectile) {
         self.projectiles.push(p);
     }
+    /// A cutting beam for one tick (call it every tick while the beam is held). Every chunk the
+    /// capsule of `radius` around the segment `origin + t·dir, t ∈ [0, range]` touches takes
+    /// `damage` (× its material multiplier), with no penetration limit; dynamic pieces it touches
+    /// get `impulse` (N·s) along the beam. `radius` 0 is a plain ray. Applied in the next tick's
+    /// projectile stage.
+    pub fn beam(&mut self, origin: [f32; 3], dir: [f32; 3], range: f32, radius: f32, damage: f32, impulse: f32) {
+        let d = v3(dir).normalize_or_zero();
+        if d != Vec3::ZERO && range > 0.0 {
+            self.beams.push(Beam { o: v3(origin), d, range, radius: radius.max(0.0), dmg: damage, imp: impulse });
+        }
+    }
     pub fn explode(&mut self, e: Explosion) {
         self.explosions.push(e);
     }
     pub fn damage_chunk(&mut self, b: BuildingId, chunk: u32, amount: f32) {
         self.damage.push((b.0, chunk, amount));
+    }
+    /// Release every pending collapse of building `b` on the next tick instead of after its
+    /// `collapse_delay` (e.g. a scripted demolition, where the warning delay only reads as lag).
+    pub fn hurry_collapse(&mut self, b: BuildingId) {
+        for p in self.pending.iter_mut().filter(|p| p.building == b.0) {
+            p.timer = 0.0;
+        }
     }
     pub fn drain_events(&mut self) -> Vec<Event> {
         std::mem::take(&mut self.events)
@@ -387,6 +514,7 @@ impl World {
             rapier_colliders: self.phys.num_colliders(),
             stress_iters: self.stress_iters,
             largest_cluster: self.clusters.values().map(|c| c.chunks.len()).max().unwrap_or(0),
+            ground_check_catches: self.ground_check_catches,
             ..Default::default()
         };
         for b in &self.buildings {
@@ -433,6 +561,10 @@ impl World {
         if self.step_stress(dt) {
             self.connectivity();
         }
+        if self.step_tipping(dt) | self.step_slivers() {
+            self.connectivity();
+        }
+        self.step_ground_check(dt);
         self.timings.stress_ms = lap(&mut t);
         // 6. promotion
         self.promote(dt);
@@ -494,6 +626,91 @@ impl World {
         });
         ps.extend(self.projectiles.drain(..));
         self.projectiles = ps;
+        let beams = std::mem::take(&mut self.beams);
+        for b in beams {
+            self.apply_beam(b);
+        }
+    }
+
+    /// See [`World::beam`].
+    fn apply_beam(&mut self, Beam { o, d, range, radius, dmg, imp }: Beam) {
+        // static / frozen chunks are one collider each; a cluster is one compound collider,
+        // so its chunks are tested individually below
+        let mut tags: Vec<u128> = vec![];
+        if radius > 0.0 {
+            // overlap the capsule in short pieces: one long diagonal capsule has a huge AABB and
+            // the broad phase would hand back half the scene
+            let piece = (radius * 8.0).max(4.0);
+            let n = (range / piece).ceil().max(1.0) as usize;
+            for i in 0..n {
+                let (t0, t1) = (range * i as f32 / n as f32, range * (i + 1) as f32 / n as f32);
+                let cap = Shape::capsule(o + d * t0, o + d * t1, radius);
+                self.phys.shape_overlaps(&cap, Pose::IDENTITY, &mut tags);
+            }
+            tags.sort_unstable();
+            tags.dedup();
+        } else {
+            let mut hits = vec![];
+            self.phys.ray_all(o, d, range, usize::MAX, &mut hits);
+            tags.extend(hits.iter().map(|h| h.tag));
+        }
+        let ray = rapier3d::prelude::Ray::new(o, d);
+        let capsule = Shape::capsule(o, o + d * range, radius);
+        let mut struck: Vec<(u32, u32)> = vec![];
+        let mut pushes: Vec<(BodyId, Vec3)> = vec![];
+        for &tag in &tags {
+            match tag_kind(tag) {
+                KIND_CHUNK => struck.push(tag_chunk(tag)),
+                KIND_CLUSTER => {
+                    let Some(cl) = self.clusters.get(tag_cluster(tag)) else { continue };
+                    let pose = self.phys.body_state(cl.body).pose;
+                    let bd = &self.buildings[cl.building as usize];
+                    // beam axis in building space, cheap reject against chunk AABBs (grown by
+                    // the radius) first
+                    let inv = pose.inverse();
+                    let (lo_o, lo_d) = (inv.transform_point(o), inv.transform_vector(d));
+                    let inv_d = Vec3::ONE / lo_d;
+                    // (along-beam distance, chunk world COM) of the nearest chunk struck
+                    let mut first = (f32::MAX, Vec3::ZERO);
+                    for &c in &cl.chunks {
+                        let ch = &bd.bld.chunks[c as usize];
+                        let t1 = (v3(ch.aabb_min) - Vec3::splat(radius) - lo_o) * inv_d;
+                        let t2 = (v3(ch.aabb_max) + Vec3::splat(radius) - lo_o) * inv_d;
+                        let (tn, tf) = (t1.min(t2).max_element().max(0.0), t1.max(t2).min_element().min(range));
+                        if tn > tf {
+                            continue;
+                        }
+                        let shape = &*bd.shapes[c as usize];
+                        let t = if radius > 0.0 {
+                            let hit = rapier3d::parry::query::intersection_test(&pose, shape, &Pose::IDENTITY, &*capsule)
+                                .map_or(false, |r| r.intersecting);
+                            hit.then_some(tn)
+                        } else {
+                            shape.cast_ray(&pose, &ray, range, true)
+                        };
+                        if let Some(t) = t {
+                            struck.push((cl.building, c));
+                            if t < first.0 {
+                                first = (t, pose.transform_point(v3(ch.com)));
+                            }
+                        }
+                    }
+                    if imp > 0.0 && first.0 < f32::MAX {
+                        // a ray pushes where it enters; a fat beam at the nearest chunk it grazes
+                        let at = if radius > 0.0 { first.1 } else { o + d * first.0 };
+                        pushes.push((cl.body, at));
+                    }
+                }
+                _ => {}
+            }
+        }
+        for (b, c) in struck {
+            let mat = self.buildings[b as usize].bld.chunks[c as usize].material;
+            self.damage.push((b, c, dmg * self.cfg.damage_mult(mat)));
+        }
+        for (body, p) in pushes {
+            self.phys.apply_impulse_at_point(body, d * imp, p);
+        }
     }
 
     fn trace_hitscan(&mut self, mut origin: Vec3, dir: Vec3, w: &WeaponParams) {
@@ -734,6 +951,7 @@ impl World {
     fn apply_damage(&mut self) {
         let dmg = std::mem::take(&mut self.damage);
         let mut removals: Vec<(u32, u32)> = vec![];
+        let weakens = self.cfg.stress.damage_weakens;
         for (b, c, amt) in dmg {
             let Some(bd) = self.buildings.get_mut(b as usize) else { continue };
             let cu = c as usize;
@@ -750,6 +968,8 @@ impl World {
             }
             if bd.hp[cu] <= 0.0 {
                 removals.push((b, c));
+            } else if weakens {
+                bd.stress_active = true; // weakened joints: re-check utilization
             }
         }
         let ed = std::mem::take(&mut self.edge_damage);
@@ -774,7 +994,12 @@ impl World {
             return;
         }
         bd.edge_alive[e as usize] = false;
+        bd.topo_changed = true;
         let (ea, eb) = (bd.bld.edges[e as usize].a, bd.bld.edges[e as usize].b);
+        if cause != BreakCause::Tipping && bd.state[ea as usize] == ChunkState::Static && bd.state[eb as usize] == ChunkState::Static {
+            bd.damage_z.push(bd.bld.edges[e as usize].centroid[2]);
+        }
+        bd.sliver_check.extend_from_slice(&[ea, eb]);
         for x in [ea, eb] {
             match bd.state[x as usize] {
                 ChunkState::Static => bd.mark_dirty(x),
@@ -786,6 +1011,13 @@ impl World {
                 _ => {}
             }
         }
+        if let ChunkState::InCluster(k) = bd.state[ea as usize] {
+            if bd.state[eb as usize] == ChunkState::InCluster(k) {
+                if let Some(cl) = self.clusters.get_mut(k) {
+                    cl.broken.push(e);
+                }
+            }
+        }
         if self.cfg.emit_edge_events {
             self.events.push(Event::EdgeBroken { building: BuildingId(b), edge: e, cause });
         }
@@ -795,6 +1027,8 @@ impl World {
     /// spawn small dynamic debris or shatter it.
     fn remove_chunk(&mut self, b: u32, c: u32) {
         let cu = c as usize;
+        let min_vol = self.debris_min_volume();
+        let (keep, max_clusters) = (self.cfg.keep_debris, self.max_clusters());
         let st = self.buildings[b as usize].state[cu];
         if st == ChunkState::Gone {
             return;
@@ -812,12 +1046,14 @@ impl World {
                 }
             }
             _ => {
-                if let Some(h) = self.buildings[b as usize].collider[cu].take() {
-                    self.drop_static_collider(h);
-                }
+                self.drop_static_collider(b, c);
             }
         }
         let bd = &mut self.buildings[b as usize];
+        if st == ChunkState::Static {
+            bd.damage_z.push(bd.bld.chunks[cu].com[2]);
+        }
+        bd.topo_changed = true;
         bd.state[cu] = ChunkState::Gone;
         bd.chunk_pose[cu] = pose;
         bd.stress_active = true;
@@ -828,6 +1064,7 @@ impl World {
                 bd.edge_alive[e] = false;
                 if bd.state[nb as usize] == ChunkState::Static {
                     bd.dirty.push(nb);
+                    bd.sliver_check.push(nb);
                 }
             }
         }
@@ -838,9 +1075,9 @@ impl World {
         let can_debris = !was_debris
             && !bd.glass(cu)
             && ch.flags & F_NO_DEBRIS == 0
-            && ch.volume >= self.cfg.debris_min_volume
-            && ch.volume <= self.cfg.debris_max_volume
-            && self.clusters.len() < self.cfg.max_dynamic_clusters
+            && ch.volume >= min_vol
+            && (keep || ch.volume <= self.cfg.debris_max_volume)
+            && self.clusters.len() < max_clusters
             && self.clusters.values().map(|c| c.chunks.len()).sum::<usize>() < self.cfg.max_chunks_in_flight;
         if can_debris {
             if !matches!(st, ChunkState::InCluster(_)) {
@@ -902,6 +1139,14 @@ impl World {
             max_breaks_per_tick: s.max_breaks_per_tick,
             bending: s.bending,
             bend_scale: s.bend_scale,
+            compression_factor: s.compression_factor,
+            tension_factor: s.tension_factor,
+            bearing_sections: s.bearing_sections,
+            buckling: s.buckling,
+            rankine_k: s.rankine_k,
+            catchup_frac: s.catchup_frac,
+            catchup_max_ms: s.catchup_max_ms,
+            region_max_nodes: s.region_max_nodes,
             ..StressConfig::default()
         }
     }
@@ -909,22 +1154,28 @@ impl World {
     /// One stress solve on a building. Edges are only reported for breaking when the solve has
     /// converged, or when it has stayed unconverged for `max_unconverged_ticks` (so a damage-induced
     /// overload still breaks within a bounded time even if the solver keeps chasing residual).
-    fn solve_building(b: &mut Building, scfg: &StressConfig, dt: f32, max_unconverged: u32) -> Vec<u32> {
-        for c in 0..b.n_chunks() {
-            b.stress_node_alive[c] = b.state[c] == ChunkState::Static && b.structural[c];
+    fn solve_building(b: &mut Building, scfg: &StressConfig, dt: f32, max_unconverged: u32, damage_weakens: bool) -> Vec<u32> {
+        for ((na, st), &s) in b.stress_node_alive.iter_mut().zip(&b.state).zip(&b.structural) {
+            *na = *st == ChunkState::Static && s;
         }
-        for (e, ed) in b.bld.edges.iter().enumerate() {
-            b.stress_edge_alive[e] =
-                b.edge_alive[e] && b.stress_node_alive[ed.a as usize] && b.stress_node_alive[ed.b as usize];
+        let na = &b.stress_node_alive;
+        for ((ea, &alive), &[a, bb]) in b.stress_edge_alive.iter_mut().zip(&b.edge_alive).zip(&b.edge_ab) {
+            *ea = alive && na[a as usize] && na[bb as usize];
+        }
+        if damage_weakens {
+            for ((s, &hp), &max) in b.stress_strength.iter_mut().zip(&b.hp).zip(&b.hp_max) {
+                *s = if max > 0.0 { (hp / max).clamp(0.0, 1.0) } else { 1.0 };
+            }
         }
         let input = StressInput {
             node_weight: &b.weight,
             node_alive: &b.stress_node_alive,
             anchor: &b.anchor,
             edge_alive: &b.stress_edge_alive,
+            node_strength: if damage_weakens { &b.stress_strength } else { &[] },
         };
-        let r = solve_step(&b.stress_graph, &mut b.stress_state, &input, scfg, dt);
-        let any_over = r.utilization.iter().any(|&u| u > 1.0);
+        let r = solve_step_lean(&b.stress_graph, &mut b.stress_state, &input, scfg, dt);
+        let any_over = b.stress_state.any_overloaded();
         if r.converged {
             b.stress_unconverged = 0;
         } else {
@@ -933,7 +1184,8 @@ impl World {
         if r.converged && r.to_break.is_empty() && !any_over {
             b.stress_active = false;
         }
-        b.utilization = r.utilization;
+        b.utilization.clear();
+        b.utilization.extend_from_slice(b.stress_state.utilization());
         if r.converged || b.stress_unconverged >= max_unconverged {
             r.to_break
         } else {
@@ -948,10 +1200,11 @@ impl World {
         }
         let scfg = self.stress_config(self.cfg.stress.load_iters.max(1));
         let settle = self.cfg.stress.settle_overloads_at_load;
+        let damage_weakens = self.cfg.stress.damage_weakens;
         let b = &mut self.buildings[bi];
         for _round in 0..self.cfg.stress.load_max_rounds.max(1) {
             for _ in 0..self.cfg.stress.load_max_calls {
-                Self::solve_building(b, &scfg, 0.0, u32::MAX);
+                Self::solve_building(b, &scfg, 0.0, u32::MAX, damage_weakens);
                 if b.stress_unconverged == 0 {
                     break;
                 }
@@ -998,6 +1251,7 @@ impl World {
         let scfg = self.stress_config(self.stress_iters);
         let min_mass = s.min_component_mass;
         let max_unconv = s.max_unconverged_ticks;
+        let damage = s.damage_weakens;
         let t0 = Instant::now();
         let results: Vec<(u32, Vec<u32>)> = self
             .buildings
@@ -1009,7 +1263,7 @@ impl World {
                     b.stress_active = false;
                     return None;
                 }
-                Some((i as u32, Self::solve_building(b, &scfg, dt, max_unconv)))
+                Some((i as u32, Self::solve_building(b, &scfg, dt, max_unconv, damage)))
             })
             .collect();
         let ms = t0.elapsed().as_secs_f32() * 1e3;
@@ -1025,6 +1279,130 @@ impl World {
             for e in edges {
                 if self.buildings[b as usize].edge_alive[e as usize] {
                     self.break_edge(b, e, BreakCause::Stress);
+                    broke = true;
+                }
+            }
+        }
+        broke
+    }
+
+    /// Backstop for the incremental connectivity: a full search of the load-carrying graph of
+    /// every building whose joints changed (throttled), collapsing whatever reaches no anchor.
+    fn step_ground_check(&mut self, dt: f32) {
+        if !self.cfg.ground_check {
+            return;
+        }
+        let interval = self.cfg.ground_check_interval;
+        let found: Vec<(u32, Vec<Vec<u32>>)> = self
+            .buildings
+            .par_iter_mut()
+            .enumerate()
+            .filter_map(|(i, b)| {
+                b.ground_timer += dt;
+                if !b.topo_changed || b.ground_timer < interval {
+                    return None;
+                }
+                b.topo_changed = false;
+                b.ground_timer = 0.0;
+                let comps = b.ungrounded_components();
+                (!comps.is_empty()).then_some((i as u32, comps))
+            })
+            .collect();
+        for (b, comps) in found {
+            for comp in comps {
+                self.ground_check_catches += comp.len();
+                if std::env::var_os("RUBBLE_DEBUG_GROUND").is_some() {
+                    eprintln!("ground check: building {b}: {} chunks reach no anchor, collapsing", comp.len());
+                }
+                self.begin_collapse(b, comp);
+            }
+        }
+    }
+
+    /// Cut loose static chunks next to recent damage that hang by slivers. Their neighbours are
+    /// re-checked on the next tick (breaking marks them), so a dangling chain comes off piece
+    /// by piece. Returns true if any edge broke.
+    fn step_slivers(&mut self) -> bool {
+        let (max_area, seat) = (self.cfg.sliver_area, self.cfg.sliver_seat_area);
+        let mut broke = false;
+        for b in 0..self.buildings.len() {
+            if self.buildings[b].sliver_check.is_empty() {
+                continue;
+            }
+            let mut cand = std::mem::take(&mut self.buildings[b].sliver_check);
+            if max_area <= 0.0 {
+                continue;
+            }
+            cand.sort_unstable();
+            cand.dedup();
+            let mut cut = vec![];
+            {
+                let bd = &self.buildings[b];
+                for &c in &cand {
+                    if bd.hangs_by_slivers(c as usize, max_area, seat) {
+                        for k in bd.csr_off[c as usize] as usize..bd.csr_off[c as usize + 1] as usize {
+                            let e = bd.csr_edge[k];
+                            if bd.edge_alive[e as usize] {
+                                cut.push(e);
+                            }
+                        }
+                    }
+                }
+            }
+            for e in cut {
+                self.break_edge(b as u32, e, BreakCause::Tipping);
+                broke = true;
+            }
+        }
+        broke
+    }
+
+    /// Tipping check on the planes of recent damage (see `Building::tipping_edges`).
+    /// Returns true if any edge broke.
+    fn step_tipping(&mut self, dt: f32) -> bool {
+        let cfg = &self.cfg;
+        let (band, margin, maxp) = (cfg.tip_band.max(0.05), cfg.tip_margin, cfg.tip_max_planes.max(1));
+        let (enabled, interval) = (cfg.tipping, cfg.tip_interval);
+        let work: Vec<(u32, Vec<u32>)> = self
+            .buildings
+            .par_iter_mut()
+            .enumerate()
+            .filter_map(|(i, b)| {
+                if !enabled {
+                    b.damage_z.clear();
+                    return None;
+                }
+                if b.damage_z.is_empty() {
+                    b.tip_timer = 0.0;
+                    return None;
+                }
+                b.tip_timer += dt;
+                if b.tip_timer < interval {
+                    return None;
+                }
+                b.tip_timer = 0.0;
+                let mut planes: Vec<i64> = vec![];
+                for &z in b.damage_z.iter().rev() {
+                    let k = (z / band).floor() as i64;
+                    if !planes.contains(&k) {
+                        planes.push(k);
+                        if planes.len() >= maxp {
+                            break;
+                        }
+                    }
+                }
+                b.damage_z.clear();
+                let mut edges: Vec<u32> = planes.iter().flat_map(|&k| b.tipping_edges((k as f32 + 0.5) * band, margin)).collect();
+                edges.sort_unstable();
+                edges.dedup();
+                (!edges.is_empty()).then_some((i as u32, edges))
+            })
+            .collect();
+        let mut broke = false;
+        for (b, edges) in work {
+            for e in edges {
+                if self.buildings[b as usize].edge_alive[e as usize] {
+                    self.break_edge(b, e, BreakCause::Tipping);
                     broke = true;
                 }
             }
@@ -1099,7 +1477,7 @@ impl World {
         let mass: f32 = keep.iter().map(|&c| bd.bld.chunks[c as usize].mass).sum();
         let vol: f32 = keep.iter().map(|&c| bd.bld.chunks[c as usize].volume).sum();
         let small = mass < self.cfg.freeze_min_mass;
-        if vol < self.cfg.debris_min_volume || (small && self.clusters.len() >= self.cfg.max_dynamic_clusters) {
+        if vol < self.debris_min_volume() || (small && self.clusters.len() >= self.max_clusters()) {
             for c in keep {
                 self.shatter_static(b, c);
             }
@@ -1130,19 +1508,19 @@ impl World {
     fn shatter_static(&mut self, b: u32, c: u32) {
         let com = self.chunk_world_com(b as usize, c as usize);
         let cu = c as usize;
-        if let Some(h) = self.buildings[b as usize].collider[cu].take() {
-            self.drop_static_collider(h);
-        }
+        self.drop_static_collider(b, c);
         let bd = &mut self.buildings[b as usize];
         bd.chunk_pose[cu] = bd.pose;
         bd.state[cu] = ChunkState::Gone;
         bd.hp[cu] = 0.0;
+        bd.topo_changed = true;
         for k in bd.csr_off[cu] as usize..bd.csr_off[cu + 1] as usize {
             let (nb, e) = (bd.csr_nbr[k], bd.csr_edge[k] as usize);
             if bd.edge_alive[e] {
                 bd.edge_alive[e] = false;
                 if bd.state[nb as usize] == ChunkState::Static {
                     bd.dirty.push(nb);
+                    bd.sliver_check.push(nb);
                 }
             }
         }
@@ -1186,12 +1564,12 @@ impl World {
             dirty: false,
             last_impact: f32::NEG_INFINITY,
             impact_dv: Vec3::ZERO,
+            broken: vec![],
+            connected: false,
         });
         for &c in &chunks {
             let cu = c as usize;
-            if let Some(h) = self.buildings[b as usize].collider[cu].take() {
-                self.drop_static_collider(h);
-            }
+            self.drop_static_collider(b, c);
             self.buildings[b as usize].state[cu] = ChunkState::InCluster(key);
         }
         let bd = &mut self.buildings[b as usize];
@@ -1209,14 +1587,22 @@ impl World {
                         edges.push(e);
                     }
                 } else {
-                    // cut ties with whatever stays behind
+                    // cut ties with whatever stays behind (and re-check what it held up)
                     bd.edge_alive[e as usize] = false;
+                    bd.topo_changed = true;
+                    if bd.state[nb as usize] == ChunkState::Static {
+                        bd.dirty.push(nb);
+                        bd.sliver_check.push(nb);
+                    }
                 }
             }
         }
         bd.stress_active = true;
-        let shapes: Vec<Shape> = chunks.iter().map(|&c| bd.shapes[c as usize].clone()).collect();
-        let (body, col) = self.phys.add_dynamic_compound(pose, &shapes, &mp, linvel, angvel, cluster_tag(key));
+        let parts = bd.compound_parts(&chunks);
+        let (body, col) = self.phys.add_dynamic_compound(pose, parts, &mp, linvel, angvel, cluster_tag(key));
+        if self.cfg.keep_debris && (debris || mp.mass < self.cfg.freeze_min_mass) {
+            self.phys.set_light_debris(col, true);
+        }
         let cl = &mut self.clusters[key];
         cl.edge_impulse = vec![0.0; edges.len()];
         cl.edges = edges;
@@ -1250,10 +1636,22 @@ impl World {
     fn rebuild_cluster(&mut self, k: ClusterKey) {
         let Some(cl) = self.clusters.get_mut(k) else { return };
         cl.dirty = false;
+        let broken = std::mem::take(&mut cl.broken);
         let b = cl.building;
         let bd = &mut self.buildings[b as usize];
-        let members: Vec<u32> = cl.chunks.iter().copied().filter(|&c| bd.state[c as usize] == ChunkState::InCluster(k)).collect();
+        let mut members = std::mem::take(&mut self.scratch_u32);
+        members.clear();
+        members.extend(cl.chunks.iter().copied().filter(|&c| bd.state[c as usize] == ChunkState::InCluster(k)));
+        // A cluster is connected after every rebuild. If it lost no chunk and every edge broken
+        // since then still has its ends connected, it is still one piece: the full walk below
+        // would find one component equal to `chunks` and change nothing.
+        if cl.connected && !broken.is_empty() && members.len() == cl.chunks.len() && bd.still_connected(k, &broken) {
+            bd.epoch = bd.epoch.wrapping_add(1).max(1); // keep the epoch sequence of the full walk
+            self.scratch_u32 = members;
+            return;
+        }
         if members.is_empty() {
+            self.scratch_u32 = members;
             let body = cl.body;
             self.clusters.remove(k);
             self.drop_body(body);
@@ -1269,7 +1667,9 @@ impl World {
                 continue;
             }
             bd.visit[s as usize] = ep;
-            let mut comp = vec![s];
+            // the first component is usually (nearly) the whole cluster
+            let mut comp = Vec::with_capacity(if comps.is_empty() { members.len() } else { 0 });
+            comp.push(s);
             let mut head = 0;
             while head < comp.len() {
                 let n = comp[head] as usize;
@@ -1285,62 +1685,64 @@ impl World {
                     }
                 }
             }
+            if comp.capacity() > 2 * comp.len() + 64 {
+                comp.shrink_to_fit();
+            }
             comps.push(comp);
         }
+        let n_members = members.len();
+        self.scratch_u32 = members;
+        cl.connected = true; // it keeps one component below
+        let changed = comps.len() > 1 || comps[0].len() != cl.chunks.len();
+        if !changed {
+            return;
+        }
         let mass_of = |comp: &Vec<u32>| comp.iter().map(|&c| bd.bld.chunks[c as usize].mass).sum::<f32>();
-        comps.sort_by(|a, b| mass_of(b).total_cmp(&mass_of(a)));
+        if comps.len() > 1 {
+            comps.sort_by(|a, b| mass_of(b).total_cmp(&mass_of(a)));
+        }
+        debug_assert!(comps.iter().map(|c| c.len()).sum::<usize>() == n_members);
         let parent_state = self.phys.body_state(cl.body);
         // parent keeps the heaviest component
         let main = comps.remove(0);
-        let changed = main.len() != cl.chunks.len() || !comps.is_empty();
-        if changed {
-            let mp = self.mass_props(b, &main);
-            let bd = &mut self.buildings[b as usize];
-            let cl = &mut self.clusters[k];
-            let mut edges = vec![];
-            for &e in &cl.edges {
-                let ed = &bd.bld.edges[e as usize];
-                if bd.edge_alive[e as usize]
-                    && bd.state[ed.a as usize] == ChunkState::InCluster(k)
-                    && bd.state[ed.b as usize] == ChunkState::InCluster(k)
-                {
-                    edges.push(e);
-                }
-            }
-            cl.chunks = main;
-            let shapes: Vec<Shape> = cl.chunks.iter().map(|&c| bd.shapes[c as usize].clone()).collect();
-            cl.collider = self.phys.set_dynamic_compound(cl.body, cl.collider, &shapes, &mp);
-            cl.mass = mp.mass;
-            cl.local_com = mp.local_com;
-            // children keep their own edges; rebuild parent edge list after splitting below
-            let mut children = vec![];
-            let debris = cl.debris;
-            for comp in comps {
-                let mpc = self.mass_props(b, &comp);
-                let com_w = parent_state.pose.transform_point(mpc.local_com);
-                let v = parent_state.linvel + parent_state.angvel.cross(com_w - parent_state.world_com);
-                // temporarily mark as not-in-parent so create_cluster cuts nothing alive between them
-                let ck = self.create_cluster(b, comp, parent_state.pose, v, parent_state.angvel, debris);
-                children.push(ck);
-            }
-            let bd = &mut self.buildings[b as usize];
-            let cl = &mut self.clusters[k];
-            edges.retain(|&e| {
-                let ed = &bd.bld.edges[e as usize];
-                bd.edge_alive[e as usize]
-                    && bd.state[ed.a as usize] == ChunkState::InCluster(k)
-                    && bd.state[ed.b as usize] == ChunkState::InCluster(k)
-            });
-            for (i, &e) in edges.iter().enumerate() {
-                bd.edge_slot[e as usize] = i as u32;
-            }
-            cl.edge_impulse = vec![0.0; edges.len()];
-            cl.edges = edges;
-            if !children.is_empty() {
-                self.events.push(Event::ClusterSplit { parent: cluster_id(k), children: children.iter().map(|&c| cluster_id(c)).collect() });
-                for c in children {
-                    self.emit_detached(c);
-                }
+        let mp = self.mass_props(b, &main);
+        let bd = &self.buildings[b as usize];
+        let cl = &mut self.clusters[k];
+        cl.chunks = main;
+        let parts = bd.compound_parts(&cl.chunks);
+        cl.collider = self.phys.set_dynamic_compound(cl.body, cl.collider, parts, &mp);
+        cl.mass = mp.mass;
+        cl.local_com = mp.local_com;
+        let debris = cl.debris;
+        let mut children = vec![];
+        for comp in comps {
+            let mpc = self.mass_props(b, &comp);
+            let com_w = parent_state.pose.transform_point(mpc.local_com);
+            let v = parent_state.linvel + parent_state.angvel.cross(com_w - parent_state.world_com);
+            let ck = self.create_cluster(b, comp, parent_state.pose, v, parent_state.angvel, debris);
+            self.clusters[ck].connected = true; // a component
+            children.push(ck);
+        }
+        // parent's internal edges: still alive with both ends in the parent (children took theirs)
+        let bd = &mut self.buildings[b as usize];
+        let cl = &mut self.clusters[k];
+        let mut edges = std::mem::take(&mut cl.edges);
+        edges.retain(|&e| {
+            let [ea, eb] = bd.edge_ab[e as usize];
+            bd.edge_alive[e as usize]
+                && bd.state[ea as usize] == ChunkState::InCluster(k)
+                && bd.state[eb as usize] == ChunkState::InCluster(k)
+        });
+        for (i, &e) in edges.iter().enumerate() {
+            bd.edge_slot[e as usize] = i as u32;
+        }
+        cl.edge_impulse.clear();
+        cl.edge_impulse.resize(edges.len(), 0.0);
+        cl.edges = edges;
+        if !children.is_empty() {
+            self.events.push(Event::ClusterSplit { parent: cluster_id(k), children: children.iter().map(|&c| cluster_id(c)).collect() });
+            for c in children {
+                self.emit_detached(c);
             }
         }
     }
@@ -1356,7 +1758,8 @@ impl World {
         let mut contacts = std::mem::take(&mut self.contacts);
         self.phys.contacts(1.0, &mut contacts);
         // (cluster, chunk, impulse vector on the cluster)
-        let mut hits: Vec<(ClusterKey, u32, Vec3)> = vec![];
+        let mut hits = std::mem::take(&mut self.scratch_hits);
+        hits.clear();
         let mut crush: Vec<(u32, u32)> = vec![];
         for ct in &contacts {
             for (tag, sub, sign) in [(ct.tag1, ct.sub1, -1.0f32), (ct.tag2, ct.sub2, 1.0)] {
@@ -1392,9 +1795,20 @@ impl World {
         // Bond load model: a rigid cluster responds to the total impulse with dv = J/M; the part of
         // a chunk's contact impulse not explained by its own share (J_c - m_c dv) must be carried
         // by its bonds.
-        hits.sort_unstable_by(|x, y| x.0.cmp(&y.0).then(x.1.cmp(&y.1)));
+        // same order as comparing (key, chunk); KeyData orders by (idx, version)
+        hits.sort_unstable_by_key(|h| {
+            let f = h.0.data().as_ffi();
+            ((f & 0xffff_ffff) as u128) << 64 | ((f >> 32) as u128) << 32 | h.1 as u128
+        });
         let mut touched: Vec<ClusterKey> = vec![];
         let mut impact_jobs: Vec<(ClusterKey, Vec<u32>, Vec3)> = vec![];
+        // per touched cluster (same order as `touched`): the edge slots that received load this
+        // tick. Only those can cross the break threshold now: every alive edge is checked in the
+        // tick its load rises, and accumulated loads only decay afterwards.
+        let mut loaded: Vec<(usize, usize)> = vec![];
+        let mut loaded_slots: Vec<u32> = vec![];
+        let mut xs: Vec<(u32, Vec3)> = vec![];
+        let mut adds: Vec<(u32, f32)> = vec![];
         let mut i = 0;
         while i < hits.len() {
             let k = hits[i].0;
@@ -1410,7 +1824,7 @@ impl World {
             let cl_chunks_len = cl.chunks.len();
             let cl_last_impact = cl.last_impact;
             // per contacted chunk: excess impulse X_c = J_c - m_c dv
-            let mut xs: Vec<(u32, Vec3)> = vec![];
+            xs.clear();
             let mut p = i;
             while p < j {
                 let c = hits[p].1;
@@ -1427,7 +1841,7 @@ impl World {
                 Ok(i) => (xs[i].1, true),
                 Err(_) => (-dv * bd.bld.chunks[c as usize].mass, false),
             };
-            let mut adds: Vec<(u32, f32)> = vec![];
+            adds.clear();
             for &(c, xc) in &xs {
                 for (nb, e) in bd.neighbors(c) {
                     if !bd.edge_alive[e as usize] || bd.state[nb as usize] != ChunkState::InCluster(k) {
@@ -1449,11 +1863,14 @@ impl World {
                 }
             }
             let cl = &mut self.clusters[k];
-            for (s, v) in adds {
+            let l0 = loaded_slots.len();
+            for &(s, v) in &adds {
                 if let Some(acc) = cl.edge_impulse.get_mut(s as usize) {
                     *acc += v;
+                    loaded_slots.push(s);
                 }
             }
+            loaded.push((l0, loaded_slots.len()));
             // landing deceleration accumulated over a short window, net of the steady
             // gravity-support impulse (a resting cluster accumulates ~0)
             let net = dv + v3(self.cfg.gravity) * self.last_dt;
@@ -1474,6 +1891,7 @@ impl World {
             i = j;
         }
         self.contacts = contacts;
+        self.scratch_hits = hits;
         crush.sort_unstable();
         crush.dedup();
         for (b, c) in crush {
@@ -1506,8 +1924,7 @@ impl World {
                 if self.cfg.impact_latency_ticks == 0 {
                     let _ = tx.send(run_impact_job(job));
                 } else {
-                    // dedicated OS thread: keeps the rayon pool free for the physics step
-                    std::thread::spawn(move || {
+                    impact_pool().spawn(move || {
                         let _ = tx.send(run_impact_job(job));
                     });
                 }
@@ -1527,21 +1944,31 @@ impl World {
                 }
             }
         }
-        touched.sort_unstable();
-        touched.dedup();
+        // `touched` is sorted and unique (hits are grouped by cluster key)
+        debug_assert!(touched.windows(2).all(|w| w[0] < w[1]));
         let factor = self.cfg.impact_factor;
         let decay = self.cfg.impact_decay;
-        for k in touched {
+        let mut to_break = vec![];
+        for (ti, k) in touched.into_iter().enumerate() {
             let Some(cl) = self.clusters.get(k) else { continue };
             let b = cl.building;
-            let mut to_break = vec![];
-            for (i, &e) in cl.edges.iter().enumerate() {
+            let (l0, l1) = loaded[ti];
+            let slots = &mut loaded_slots[l0..l1];
+            slots.sort_unstable();
+            to_break.clear();
+            let mut last = u32::MAX;
+            for &s in slots.iter() {
+                if s == last {
+                    continue;
+                }
+                last = s;
+                let e = cl.edges[s as usize];
                 let strength = self.buildings[b as usize].bld.edges[e as usize].strength;
-                if cl.edge_impulse[i] > strength * factor {
+                if cl.edge_impulse[s as usize] > strength * factor {
                     to_break.push(e);
                 }
             }
-            for e in to_break {
+            for &e in &to_break {
                 self.break_edge(b, e, BreakCause::Impact);
             }
         }
@@ -1552,7 +1979,7 @@ impl World {
         }
         let t0 = Instant::now();
         self.rebuild_dirty_clusters();
-        if std::env::var("RUBBLE_DEBUG_IMPACT").is_ok() && t0.elapsed().as_secs_f32() > 1e-3 {
+        if debug_impact() && t0.elapsed().as_secs_f32() > 1e-3 {
             eprintln!("rebuild clusters {:.2} ms ({} clusters)", t0.elapsed().as_secs_f32() * 1e3, self.clusters.len());
         }
     }
@@ -1606,8 +2033,18 @@ impl World {
             }
         }
         let mut scfg = self.stress_config(self.cfg.impact_iters);
+        // impact stress keeps the joint model it was tuned with (no crushing/tipping/buckling;
+        // the landing load is transient)
+        scfg.compression_factor = 10.0;
+        scfg.bearing_sections = false;
+        scfg.buckling = false;
+        scfg.catchup_frac = 0.0;
         scfg.hold_time = 0.0;
         scfg.tol = self.cfg.impact_tol;
+        // big landing solves dominate the worst ticks (the tick that collects them blocks on
+        // them): run their CG kernels on rayon. The CG reductions use fixed chunks, so the result
+        // is bit-identical to the sequential solve.
+        scfg.par_threshold = IMPACT_PAR_THRESHOLD;
         ImpactJob {
             building: b,
             graph: bd.stress_graph.clone(),
@@ -1621,7 +2058,7 @@ impl World {
             joint: self.cfg.impact_joint_factor.max(1e-3),
             rounds: self.cfg.impact_rounds.max(1),
             max_breaks: self.cfg.impact_max_breaks,
-            debug: std::env::var("RUBBLE_DEBUG_IMPACT").is_ok().then(|| format!("t={:.2} chunks={} dv={dv:.2} g_eff={g_eff:.0}", self.time, cl.chunks.len())),
+            debug: debug_impact().then(|| format!("t={:.2} chunks={} dv={dv:.2} g_eff={g_eff:.0}", self.time, cl.chunks.len())),
         }
     }
 
@@ -1638,7 +2075,7 @@ impl World {
             let big = !cl.debris && cl.mass >= self.cfg.freeze_min_mass;
             if s.world_com.z < -100.0 {
                 despawn.push(k);
-            } else if (big || self.cfg.freeze_debris)
+            } else if (big || self.cfg.freeze_debris || self.cfg.keep_debris)
                 && cl.rest_time >= self.cfg.freeze_time
                 && cl.age >= self.cfg.freeze_min_age
                 // a body resting on something that still moves would be left hanging when that
@@ -1646,10 +2083,12 @@ impl World {
                 && !self.phys.touches_moving_dynamic(cl.body, self.cfg.rest_lin_vel, self.cfg.rest_ang_vel)
             {
                 freeze.push(k);
-            } else if !big && cl.age >= self.cfg.debris_ttl {
+            } else if !big && cl.age >= if self.cfg.keep_debris { self.cfg.keep_debris_max_age } else { self.cfg.debris_ttl } {
                 despawn.push(k);
-            } else if cl.age >= self.cfg.max_dynamic_time {
-                if big { freeze.push(k) } else { despawn.push(k) }
+            } else if big && cl.age >= self.cfg.max_dynamic_time {
+                freeze.push(k);
+            } else if !big && !self.cfg.keep_debris && cl.age >= self.cfg.max_dynamic_time {
+                despawn.push(k);
             }
         }
         for k in freeze {
@@ -1662,7 +2101,7 @@ impl World {
 
     fn budgets(&mut self) {
         let mut in_flight: usize = self.clusters.values().map(|c| c.chunks.len()).sum();
-        let mut over = self.clusters.len().saturating_sub(self.cfg.max_dynamic_clusters);
+        let mut over = self.clusters.len().saturating_sub(self.max_clusters());
         if over == 0 && in_flight <= self.cfg.max_chunks_in_flight {
             return;
         }
@@ -1683,12 +2122,22 @@ impl World {
         }
     }
 
+    /// Smallest destroyed chunk / detached piece kept as debris (smaller ones shatter).
+    fn debris_min_volume(&self) -> f32 {
+        if self.cfg.keep_debris { self.cfg.keep_debris_min_volume } else { self.cfg.debris_min_volume }
+    }
+
+    /// Cap on moving pieces (see `WorldConfig::keep_debris`).
+    fn max_clusters(&self) -> usize {
+        if self.cfg.keep_debris { self.cfg.keep_debris_max_clusters } else { self.cfg.max_dynamic_clusters }
+    }
+
     /// Remove a static (building or frozen) collider and remember where it was.
-    fn drop_static_collider(&mut self, h: ColliderId) {
+    fn drop_static_collider(&mut self, b: u32, c: u32) {
+        let bd = &mut self.buildings[b as usize];
+        let Some(h) = bd.collider[c as usize].take() else { return };
         if self.cfg.thaw_unsupported {
-            if let Some(a) = self.phys.collider_aabb(h) {
-                self.support_lost.push(a);
-            }
+            self.support_lost.push(bd.collider_aabb[c as usize]);
         }
         self.phys.remove_collider(h);
     }
@@ -1712,18 +2161,83 @@ impl World {
     fn thaw_unsupported(&mut self) {
         if !self.cfg.thaw_unsupported {
             self.support_lost.clear();
+            self.support_watch.clear();
             return;
         }
         let boxes = std::mem::take(&mut self.support_lost);
         let m = self.cfg.thaw_margin;
         let mut hits = vec![];
         let mut seeds: Vec<(u32, u32)> = vec![];
-        for (lo, hi) in boxes {
-            let qlo = Vec3::new(lo.x - m, lo.y - m, lo.z - m);
-            let qhi = Vec3::new(hi.x + m, hi.y + m, hi.z + m);
-            self.phys.wake_bodies_in_aabb(qlo, qhi);
+        // The box queries only matter through sleeping bodies (woken) and frozen chunks (seeds);
+        // skip the half that has nothing to find (neither set changes during the loop).
+        let (wake, seek) = if boxes.is_empty() {
+            (false, false)
+        } else {
+            (
+                self.clusters.values().any(|cl| self.phys.body_state(cl.body).sleeping),
+                self.buildings.iter().any(|b| b.state.contains(&ChunkState::Frozen)),
+            )
+        };
+        let dilate = |(lo, hi): (Vec3, Vec3)| (Vec3::new(lo.x - m, lo.y - m, lo.z - m), Vec3::new(hi.x + m, hi.y + m, hi.z + m));
+        // A box only matters if it finds a sleeping body or a frozen chunk. Pre-test spatially
+        // grouped boxes (a box finds nothing its group's bounding box does not); boxes of groups
+        // that find nothing are skipped. Exact: sleeping bodies only get fewer and frozen chunks
+        // do not change while the boxes are processed, which happens in the original order.
+        let mut live = vec![true; if wake || seek { boxes.len() } else { 0 }];
+        if live.len() > THAW_BOX_GROUP {
+            let (mut lo, mut hi) = (Vec3::splat(f32::INFINITY), Vec3::splat(f32::NEG_INFINITY));
+            for &(a, b) in &boxes {
+                lo = lo.min(a + b);
+                hi = hi.max(a + b);
+            }
+            let scale = Vec3::splat(1023.0) / (hi - lo).max(Vec3::splat(1e-6));
+            let mut order: Vec<(u32, u32)> = boxes
+                .iter()
+                .enumerate()
+                .map(|(i, &(a, b))| {
+                    let q = ((a + b - lo) * scale).clamp(Vec3::ZERO, Vec3::splat(1023.0));
+                    (morton3(q.x as u32, q.y as u32, q.z as u32), i as u32)
+                })
+                .collect();
+            order.sort_unstable();
+            let buildings = &self.buildings;
+            let frozen = |tag: u128| {
+                seek && tag_kind(tag) == KIND_CHUNK && {
+                    let (b, c) = tag_chunk(tag);
+                    buildings[b as usize].state[c as usize] == ChunkState::Frozen
+                }
+            };
+            // hierarchical: test a Morton range's bounding box, recurse into halves that touch
+            let mut stack = vec![(0usize, order.len())];
+            while let Some((a, b)) = stack.pop() {
+                let (mut glo, mut ghi) = dilate(boxes[order[a].1 as usize]);
+                for &(_, i) in &order[a + 1..b] {
+                    let (l, h) = dilate(boxes[i as usize]);
+                    glo = glo.min(l);
+                    ghi = ghi.max(h);
+                }
+                if !self.phys.aabb_touches(glo, ghi, wake, &frozen) {
+                    for &(_, i) in &order[a..b] {
+                        live[i as usize] = false;
+                    }
+                } else if b - a > THAW_BOX_GROUP {
+                    let mid = (a + b) / 2;
+                    stack.push((mid, b));
+                    stack.push((a, mid));
+                }
+            }
+        }
+        for (i, &bx) in boxes.iter().enumerate() {
+            if !live.get(i).copied().unwrap_or(false) {
+                continue;
+            }
+            let (qlo, qhi) = dilate(bx);
             hits.clear();
-            self.phys.query_aabb(qlo, qhi, &mut hits);
+            match (wake, seek) {
+                (true, true) => self.phys.wake_and_query_aabb(qlo, qhi, &mut hits),
+                (true, false) => self.phys.wake_bodies_in_aabb(qlo, qhi),
+                _ => self.phys.query_aabb(qlo, qhi, &mut hits),
+            }
             for &(_, tag) in &hits {
                 if tag_kind(tag) == KIND_CHUNK {
                     let (b, c) = tag_chunk(tag);
@@ -1758,6 +2272,7 @@ impl World {
                 budget -= 1;
             }
         }
+        seeds.append(&mut self.support_watch);
         let mut checked = std::collections::HashSet::new();
         for (b, c) in seeds {
             if self.buildings[b as usize].state[c as usize] != ChunkState::Frozen || !checked.insert((b, c)) {
@@ -1767,8 +2282,14 @@ impl World {
             for &g in &group {
                 checked.insert((b, g));
             }
-            if self.group_supported(b, &group) {
-                continue;
+            match self.group_supported(b, &group) {
+                Support::Solid => continue,
+                Support::Transient => {
+                    // resting on something that may move away: look again next tick
+                    self.support_watch.push((b, c));
+                    continue;
+                }
+                Support::None => {}
             }
             let bd = &self.buildings[b as usize];
             let pose = bd.chunk_pose[c as usize];
@@ -1783,7 +2304,7 @@ impl World {
     /// the group touches it when moved down by `thaw_probe` but not when lifted by the same
     /// amount. Side contacts persist both ways, so two piles leaning on each other in mid-air
     /// do not hold each other up.
-    fn group_supported(&self, b: u32, group: &[u32]) -> bool {
+    fn group_supported(&self, b: u32, group: &[u32]) -> Support {
         let bd = &self.buildings[b as usize];
         let members: std::collections::HashSet<u32> = group.iter().copied().collect();
         let outside = |tag: &u128| {
@@ -1792,30 +2313,166 @@ impl World {
                 tb == b && members.contains(&tc)
             })
         };
-        // lowest chunks first: they are the ones that rest on something; stop at the first hit
-        let mut order: Vec<(f32, u32)> = group
-            .iter()
-            .map(|&c| (bd.chunk_pose[c as usize].transform_point(v3(bd.bld.chunks[c as usize].aabb_min)).z, c))
-            .collect();
+        self.rests_on_something(b, group, |c| bd.chunk_pose[c as usize], outside, Some(self.cfg.tip_margin))
+    }
+
+    /// Shared by the thaw check and `floating_report`: do the chunks (at `pose_of(c)`) touch
+    /// anything accepted by `outside` when moved down by `thaw_probe` but not when lifted?
+    ///
+    /// With `com_margin`, a group of several chunks only counts as solidly supported if its
+    /// centre of mass lies over (within the margin of) the footprint of its chunks that rest on
+    /// something solid: a frozen floor whose supports were shot away except under one corner
+    /// must come down and tip, not hang off that corner.
+    fn rests_on_something(
+        &self, b: u32, chunks: &[u32], pose_of: impl Fn(u32) -> Pose, outside: impl Fn(&u128) -> bool, com_margin: Option<f32>,
+    ) -> Support {
+        let com_margin = com_margin.filter(|_| chunks.len() > 1);
+        let mut patches: Vec<[f64; 2]> = vec![];
+        let bd = &self.buildings[b as usize];
+        // lowest chunks first: they are the ones that rest on something; stop at the first solid hit
+        let mut order: Vec<(f32, u32)> =
+            chunks.iter().map(|&c| (pose_of(c).transform_point(v3(bd.bld.chunks[c as usize].aabb_min)).z, c)).collect();
         order.sort_by(|a, b| a.0.total_cmp(&b.0));
         let d = Vec3::Z * self.cfg.thaw_probe;
         let (mut below, mut above) = (vec![], vec![]);
+        // static building or frozen rubble stays put; a body or a collapsing piece may move away
+        let solid = |t: u128| match tag_kind(t) {
+            KIND_GROUND => true,
+            KIND_CHUNK => {
+                let (tb, tc) = tag_chunk(t);
+                matches!(self.buildings[tb as usize].state[tc as usize], ChunkState::Static | ChunkState::Frozen)
+            }
+            _ => false,
+        };
+        let mut transient = false;
+        let mut judge = |hits: &mut dyn Iterator<Item = u128>| {
+            for t in hits {
+                if solid(t) {
+                    return true;
+                }
+                transient = true;
+            }
+            false
+        };
         for (_, c) in order {
-            let p = bd.chunk_pose[c as usize];
+            let p = pose_of(c);
             let shape = &bd.shapes[c as usize];
             below.clear();
             self.phys.shape_overlaps(shape, Pose::from_parts(p.translation - d, p.rotation), &mut below);
-            below.retain(outside);
+            below.retain(|t| outside(t));
             if below.is_empty() {
                 continue;
             }
+            // the ground is never beside you; debris sunk into it by more than the probe still rests on it
+            let mut on_solid = below.iter().any(|t| tag_kind(*t) == KIND_GROUND);
             above.clear();
             self.phys.shape_overlaps(shape, Pose::from_parts(p.translation + d, p.rotation), &mut above);
-            if below.iter().any(|t| !above.contains(t)) {
-                return true;
+            let mut under: Vec<u128> = below.iter().copied().filter(|t| !above.contains(t)).collect();
+            if under.is_empty() {
+                // wedged into a pile (penetration deeper than the probe): what it rests on lets go
+                // within a short lift, a wall beside it does not
+                above.clear();
+                self.phys.shape_overlaps(shape, Pose::from_parts(p.translation + d * 8.0, p.rotation), &mut above);
+                under = below.iter().copied().filter(|t| !above.contains(t)).collect();
+            }
+            on_solid = on_solid || judge(&mut under.into_iter());
+            if on_solid {
+                if com_margin.is_none() {
+                    return Support::Solid;
+                }
+                let bb = shape.compute_aabb(&p);
+                let (lo, hi) = (bb.mins, bb.maxs);
+                patches.extend_from_slice(&[
+                    [lo.x as f64, lo.y as f64],
+                    [hi.x as f64, lo.y as f64],
+                    [hi.x as f64, hi.y as f64],
+                    [lo.x as f64, hi.y as f64],
+                ]);
             }
         }
-        false
+        if let (Some(margin), false) = (com_margin, patches.is_empty()) {
+            let (mut m, mut cx, mut cy) = (0f64, 0f64, 0f64);
+            for &c in chunks {
+                let ch = &bd.bld.chunks[c as usize];
+                let w = pose_of(c).transform_point(v3(ch.com));
+                m += ch.mass as f64;
+                cx += ch.mass as f64 * w.x as f64;
+                cy += ch.mass as f64 * w.y as f64;
+            }
+            if m > 0.0 && crate::building::dist_outside_hull(&mut patches, [cx / m, cy / m]) <= margin as f64 {
+                return Support::Solid;
+            }
+        }
+        if transient { Support::Transient } else { Support::None }
+    }
+
+    fn touching(&self, b: u32, chunks: &[u32], pose_of: impl Fn(u32) -> Pose, outside: impl Fn(&u128) -> bool) -> usize {
+        let bd = &self.buildings[b as usize];
+        let mut all = std::collections::HashSet::new();
+        let mut hits = vec![];
+        for &c in chunks {
+            hits.clear();
+            self.phys.shape_overlaps(&bd.shapes[c as usize], pose_of(c), &mut hits);
+            all.extend(hits.iter().copied().filter(|t| outside(t)));
+        }
+        all.len()
+    }
+
+    /// Diagnostic: static chunks of the intact structure that no longer reach an anchor through
+    /// alive joints (a full search from every anchor, independent of the incremental dirty-node
+    /// search) and are not already waiting to collapse. Structural chunks, then non-structural
+    /// (glass, cosmetic) ones that hang on nothing grounded. Should always be empty after `step`.
+    pub fn unanchored_static(&self, b: BuildingId) -> (Vec<u32>, Vec<u32>) {
+        let bd = &self.buildings[b.0 as usize];
+        let (mut structural, mut loose) = (vec![], vec![]);
+        for comp in bd.ungrounded_components() {
+            for c in comp {
+                if bd.structural[c as usize] { structural.push(c) } else { loose.push(c) }
+            }
+        }
+        (structural, loose)
+    }
+
+    /// Diagnostic: rubble that should be falling but is not. Lists frozen groups and resting
+    /// (sleeping or slow) dynamic clusters that have nothing under them. O(chunks) shape
+    /// queries: for tests and debug overlays, not for every tick.
+    pub fn floating_report(&self) -> FloatingReport {
+        let mut rep = FloatingReport::default();
+        for (bi, bd) in self.buildings.iter().enumerate() {
+            let b = bi as u32;
+            let mut seen = std::collections::HashSet::new();
+            for c in 0..bd.n_chunks() as u32 {
+                if bd.state[c as usize] != ChunkState::Frozen || seen.contains(&c) {
+                    continue;
+                }
+                let group = self.frozen_group(b, c);
+                seen.extend(group.iter().copied());
+                if self.group_supported(b, &group) == Support::None {
+                    let z = group.iter().map(|&g| self.chunk_world_com(bi, g as usize).z).fold(f32::INFINITY, f32::min);
+                    let members: std::collections::HashSet<u32> = group.iter().copied().collect();
+                    let touching = self.touching(b, &group, |g| bd.chunk_pose[g as usize], |t| {
+                        !(tag_kind(*t) == KIND_CHUNK && tag_chunk(*t).0 == b && members.contains(&tag_chunk(*t).1))
+                    });
+                    rep.frozen.push(FloatingGroup { building: BuildingId(b), chunks: group, min_com_z: z, touching });
+                }
+            }
+        }
+        for (k, cl) in self.clusters.iter() {
+            let s = self.phys.body_state(cl.body);
+            let resting = s.sleeping || (s.linvel.length() < self.cfg.rest_lin_vel && s.angvel.length() < self.cfg.rest_ang_vel);
+            if !resting {
+                continue;
+            }
+            let me = cluster_tag(k);
+            let b = cl.building;
+            let bi = b as usize;
+            if self.rests_on_something(b, &cl.chunks, |c| self.chunk_world_pose(bi, c as usize), |t| *t != me, None) == Support::None {
+                let z = cl.chunks.iter().map(|&g| self.chunk_world_com(bi, g as usize).z).fold(f32::INFINITY, f32::min);
+                let touching = self.touching(b, &cl.chunks, |c| self.chunk_world_pose(bi, c as usize), |t| *t != me);
+                rep.clusters.push((cluster_id(k), FloatingGroup { building: BuildingId(b), chunks: cl.chunks.clone(), min_com_z: z, touching }));
+            }
+        }
+        rep
     }
 
     /// The frozen chunks that froze together with `seed`: connected over alive internal edges
@@ -1858,10 +2515,15 @@ impl World {
             }
             bd.state[cu] = ChunkState::Frozen;
             bd.chunk_pose[cu] = s.pose;
-            let h = self.phys.add_static_collider(bd.shapes[cu].clone(), s.pose, chunk_tag(b, c));
+            let (h, aabb) = self.phys.add_static_collider(bd.shapes[cu].clone(), s.pose, chunk_tag(b, c));
             bd.collider[cu] = Some(h);
+            bd.collider_aabb[cu] = aabb;
         }
         self.needs_sync = true;
+        // classify its support next tick (it may rest on rubble that is still moving)
+        if let Some(&c) = cl.chunks.first() {
+            self.support_watch.push((b, c));
+        }
         self.events.push(Event::ClusterFrozen { cluster: cluster_id(k), transform: pose_to_rowmajor(&s.pose) });
     }
 

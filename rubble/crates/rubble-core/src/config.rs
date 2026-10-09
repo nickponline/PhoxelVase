@@ -23,6 +23,23 @@ pub struct StressSettings {
     /// pre-crack joints that are overloaded in the intact building (see `World::load_building`)
     pub settle_overloads_at_load: bool,
     pub load_max_rounds: usize,
+    /// bearing (compression) capacity multiplier on joint strength (see rubble-stress)
+    pub compression_factor: f32,
+    /// tension capacity multiplier on the far side of eccentrically loaded bearing sections
+    pub tension_factor: f32,
+    /// eccentric bearing sections (tipping) on vertical-normal joints
+    pub bearing_sections: bool,
+    /// Rankine buckling of column stacks (unbraced length between slab connections)
+    pub buckling: bool,
+    pub rankine_k: f32,
+    /// a tick removing support that carried more than this share of the load triggers a full
+    /// solve to convergence (≤ catchup_max_ms); 0 disables
+    pub catchup_frac: f32,
+    pub catchup_max_ms: f32,
+    /// joint capacity scales with the remaining hp fraction of its weaker chunk
+    pub damage_weakens: bool,
+    /// buildings with at most this many supported chunks are always solved globally
+    pub region_max_nodes: usize,
 }
 
 impl Default for StressSettings {
@@ -42,6 +59,15 @@ impl Default for StressSettings {
             load_max_calls: 50,
             settle_overloads_at_load: true,
             load_max_rounds: 64,
+            compression_factor: 3.5,
+            tension_factor: 5.0,
+            bearing_sections: true,
+            buckling: true,
+            rankine_k: 1200.0,
+            catchup_frac: 0.05,
+            catchup_max_ms: 20.0,
+            damage_weakens: true,
+            region_max_nodes: 16384,
         }
     }
 }
@@ -70,10 +96,43 @@ pub struct WorldConfig {
     pub crush_dv: f32,
     pub crush_max_chunks: usize,
     pub freeze_min_mass: f32,
+    /// Keep debris around as rubble instead of removing it: destroyed chunks of any size from
+    /// `keep_debris_min_volume` up (instead of `debris_min_volume`..`debris_max_volume`) become
+    /// debris, up to `keep_debris_max_clusters` moving pieces (instead of
+    /// `max_dynamic_clusters`), resting debris
+    /// freezes into rubble instead of despawning after `debris_ttl` / `max_dynamic_time`
+    /// (only debris still moving after `keep_debris_max_age` is removed), and light pieces
+    /// (debris, or under `freeze_min_mass`) do not collide with each other while moving.
+    pub keep_debris: bool,
+    pub keep_debris_min_volume: f32,
+    pub keep_debris_max_age: f32,
+    pub keep_debris_max_clusters: usize,
     /// clusters still moving after this long are force-frozen (big) or despawned (small)
     pub max_dynamic_time: f32,
     pub rest_lin_vel: f32,
     pub rest_ang_vel: f32,
+    /// Rigid-body tipping check (`Building::tipping_edges`) on horizontal planes at the heights
+    /// of recent damage: a group of the intact structure whose centre of mass is more than
+    /// `tip_margin` (m) outside the joints it stands on is cut loose and falls.
+    pub tipping: bool,
+    pub tip_margin: f32,
+    /// seconds between checks per damaged building (damage heights accumulate meanwhile)
+    pub tip_interval: f32,
+    /// damage heights are merged into planes on this grid (m)
+    pub tip_band: f32,
+    /// at most this many planes per check (the most recently damaged first)
+    pub tip_max_planes: usize,
+    /// Full ground check (`Building::ungrounded_components`) at most every
+    /// `ground_check_interval` s per building whose joints changed: anything the load-carrying
+    /// graph no longer connects to an anchor collapses, whatever the incremental search found.
+    pub ground_check: bool,
+    pub ground_check_interval: f32,
+    /// After damage, a static chunk next to it that is left hanging by slivers (alive joints
+    /// totalling less than `sliver_area` m², none of them a joint of at least
+    /// `sliver_seat_area` m² under its centre of mass) is cut loose: the joint graph still
+    /// connects it to the ground, but nothing visibly holds it up.
+    pub sliver_area: f32,
+    pub sliver_seat_area: f32,
     /// When geometry is removed (destroyed, detached, despawned), wake sleeping bodies around it
     /// and turn frozen rubble that rested on it back into falling clusters.
     pub thaw_unsupported: bool,
@@ -141,6 +200,11 @@ pub struct WorldConfig {
     /// rapier continuous collision detection (off: debris faster than ~18 m/s may tunnel thin slabs)
     pub ccd: bool,
     pub solver_iterations: usize,
+    /// Worker threads for the rigid-body step (a process-wide pool per size). Rapier's results do
+    /// not depend on the thread count; a few threads beat the whole machine for this workload
+    /// (less fork/join and spin overhead; on an M3 Max 6 was fastest). 0 = auto
+    /// (`RUBBLE_PHYSICS_THREADS` if set, else min(6, cores / 2)).
+    pub physics_threads: usize,
     pub stress: StressSettings,
 }
 
@@ -160,9 +224,22 @@ impl Default for WorldConfig {
             crush_dv: 6.0,
             crush_max_chunks: 4,
             freeze_min_mass: 500.0,
+            keep_debris: false,
+            keep_debris_min_volume: 0.01,
+            keep_debris_max_age: 120.0,
+            keep_debris_max_clusters: 2048,
             max_dynamic_time: 30.0,
             rest_lin_vel: 0.15,
             rest_ang_vel: 0.25,
+            ground_check: true,
+            ground_check_interval: 0.1,
+            sliver_area: 0.05,
+            sliver_seat_area: 0.02,
+            tipping: true,
+            tip_margin: 0.5,
+            tip_interval: 0.1,
+            tip_band: 0.5,
+            tip_max_planes: 8,
             thaw_unsupported: true,
             thaw_margin: 0.06,
             thaw_probe: 0.03,
@@ -200,6 +277,7 @@ impl Default for WorldConfig {
             emit_edge_events: false,
             ccd: false,
             solver_iterations: 4,
+            physics_threads: 0,
             stress: StressSettings::default(),
         }
     }

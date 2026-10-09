@@ -38,14 +38,7 @@ fn to_py_err<E: std::fmt::Display>(e: E) -> PyErr {
 
 /// Stress graph exactly as `rubble_core::Building::new` builds it.
 fn stress_graph_of(bld: &Bld) -> StressGraph {
-    let pairs: Vec<(u32, u32)> = bld.edges.iter().map(|e| (e.a, e.b)).collect();
-    let cap: Vec<f32> = bld.edges.iter().map(|e| e.strength).collect();
-    let cen: Vec<[f32; 3]> = bld.edges.iter().map(|e| e.centroid).collect();
-    let nrm: Vec<[f32; 3]> = bld.edges.iter().map(|e| e.normal).collect();
-    let pos: Vec<[f32; 3]> = bld.chunks.iter().map(|c| c.com).collect();
-    let area: Vec<f32> = bld.edges.iter().map(|e| e.area).collect();
-    let elem: Vec<u32> = bld.chunks.iter().map(|c| c.elem).collect();
-    StressGraph::new(bld.chunks.len(), &pairs, &cap, &cen, &nrm, &pos).with_areas(&area).with_node_groups(&elem)
+    rubble_core::building::stress_graph_for(bld)
 }
 
 fn report_to_dict<'py>(py: Python<'py>, r: StaticReport, g: &StressGraph) -> PyResult<Bound<'py, PyDict>> {
@@ -94,7 +87,7 @@ fn static_stress_report<'py>(
     let edge_alive: Vec<bool> =
         bld.edges.iter().map(|e| structural[e.a as usize] && structural[e.b as usize]).collect();
     let g = stress_graph_of(&bld);
-    let input = StressInput { node_weight: &weight, node_alive: &structural, anchor: &anchor, edge_alive: &edge_alive };
+    let input = StressInput { node_weight: &weight, node_alive: &structural, anchor: &anchor, edge_alive: &edge_alive, ..Default::default() };
     let r = static_report(&g, &input, &stress_cfg(bending, bend_scale));
     report_to_dict(py, r, &g)
 }
@@ -273,9 +266,29 @@ impl World {
             .enumerate()
             .map(|(e, ed)| bd.edge_alive[e] && node_alive[ed.a as usize] && node_alive[ed.b as usize])
             .collect();
-        let input = StressInput { node_weight: &bd.weight, node_alive: &node_alive, anchor: &bd.anchor, edge_alive: &edge_alive };
         let s = &self.w.cfg.stress;
-        let r = static_report(&bd.stress_graph, &input, &stress_cfg(bending.unwrap_or(s.bending), s.bend_scale));
+        let strength: Vec<f32> = (0..bd.n_chunks())
+            .map(|c| {
+                let max = bd.bld.chunks[c].hp;
+                if s.damage_weakens && max > 0.0 { (bd.hp[c] / max).clamp(0.0, 1.0) } else { 1.0 }
+            })
+            .collect();
+        let input = StressInput {
+            node_weight: &bd.weight,
+            node_alive: &node_alive,
+            anchor: &bd.anchor,
+            edge_alive: &edge_alive,
+            node_strength: &strength,
+        };
+        let cfg = StressConfig {
+            compression_factor: s.compression_factor,
+            tension_factor: s.tension_factor,
+            bearing_sections: s.bearing_sections,
+            buckling: s.buckling,
+            rankine_k: s.rankine_k,
+            ..stress_cfg(bending.unwrap_or(s.bending), s.bend_scale)
+        };
+        let r = static_report(&bd.stress_graph, &input, &cfg);
         report_to_dict(py, r, &bd.stress_graph)
     }
 

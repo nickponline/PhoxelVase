@@ -1,0 +1,15 @@
+# Robed colossus raising a torch (Liberty-like) on a stepped concrete pedestal; the figure is
+# a solid metal casting built from lathed, ellipsoid and swept-tube primitives.
+name: colossus
+preset: structure
+seed: 1
+nodes:
+  - sculpt:
+      template: colossus
+      layer: 0.4
+      figure: [25.0, 31.0]
+      pedestal: [13.0, 16.0]
+      arm_raise: [4.0, 16.0]
+      ground: {pad: 4.0}
+# Slender members sit near the 0.5 target in the coarser variants: accept up to 0.8.
+stability: {accept_util: 0.8, max_rounds: 12}

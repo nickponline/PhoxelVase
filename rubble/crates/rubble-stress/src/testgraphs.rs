@@ -16,6 +16,10 @@ pub struct TestGraph {
     pub normal: Vec<[f32; 3]>,
     pub area: Vec<f32>,
     pub edge_alive: Vec<bool>,
+    /// Per-node strength fraction (empty = all 1); see [`TestGraph::set_strength`].
+    pub node_strength: Vec<f32>,
+    /// Column thickness per node (empty = no columns); see [`TestGraph::set_column`].
+    pub col_thick: Vec<f32>,
 }
 
 impl TestGraph {
@@ -46,8 +50,15 @@ impl TestGraph {
     }
     /// Build the solver graph (with areas).
     pub fn graph(&self) -> StressGraph {
-        StressGraph::new(self.n_nodes(), &self.edges, &self.capacity, &self.centroid, &self.normal, &self.node_pos)
-            .with_areas(&self.area)
+        let g = StressGraph::new(self.n_nodes(), &self.edges, &self.capacity, &self.centroid, &self.normal, &self.node_pos)
+            .with_areas(&self.area);
+        if self.col_thick.is_empty() {
+            g
+        } else {
+            let mut t = self.col_thick.clone();
+            t.resize(self.n_nodes(), 0.0);
+            g.with_columns(&t)
+        }
     }
     pub fn input(&self) -> StressInput<'_> {
         StressInput {
@@ -55,7 +66,18 @@ impl TestGraph {
             node_alive: &self.node_alive,
             anchor: &self.anchor,
             edge_alive: &self.edge_alive,
+            node_strength: &self.node_strength,
         }
+    }
+    /// Set node i's remaining strength fraction (damage).
+    pub fn set_strength(&mut self, i: u32, s: f32) {
+        self.node_strength.resize(self.n_nodes(), 1.0);
+        self.node_strength[i as usize] = s;
+    }
+    /// Mark node i as a column chunk of the given section thickness.
+    pub fn set_column(&mut self, i: u32, thickness: f32) {
+        self.col_thick.resize(self.n_nodes(), 0.0);
+        self.col_thick[i as usize] = thickness;
     }
     /// Find the edge between a and b (either orientation).
     pub fn edge_between(&self, a: u32, b: u32) -> Option<u32> {

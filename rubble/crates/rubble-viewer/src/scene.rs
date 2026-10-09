@@ -16,11 +16,21 @@ pub struct Args {
     pub frames: u32,
     pub explode: Option<[f32; 5]>,
     pub explode_frame: u32,
+    /// screenshot mode: hold the beam (engine origin, direction) from `explode_frame` on
+    pub beam: Option<[f32; 6]>,
     pub cam: Option<[f32; 3]>,
     pub look: Option<[f32; 3]>,
     pub overlays: Vec<String>,
     pub width: f32,
     pub height: f32,
+    /// record mode: save a PNG every `record_every` sim ticks into this directory
+    pub record: Option<PathBuf>,
+    pub record_every: u32,
+    /// screenshot/record mode: press X (demolish every building) at this frame
+    pub demolish_frame: Option<u32>,
+    /// screenshot/record mode: render this many seconds before the simulation starts (shader
+    /// pipelines compile asynchronously; frames captured before that are black)
+    pub warmup: f32,
 }
 
 fn parse_vec<const N: usize>(s: &str) -> Result<[f32; N], String> {
@@ -30,13 +40,16 @@ fn parse_vec<const N: usize>(s: &str) -> Result<[f32; N], String> {
 
 pub const USAGE: &str = "usage: rubble-viewer [FILE.bld ...] [--scenario S.yaml] [--arena N]
        [--screenshot OUT.png --frames N [--explode x,y,z,r[,damage]] [--explode-frame K]
-        [--cam x,y,z] [--look x,y,z] [--overlay f1,f2,f3,f4,f5] [--size WxH]]
+        [--beam x,y,z,dx,dy,dz] [--cam x,y,z] [--look x,y,z] [--overlay f1,f2,f3,f4,f5] [--size WxH]]
+       [--record DIR --frames N [--record-every K]]   frames DIR/frame_00000.png ... every K ticks (default 4)
+       [--demolish-frame K]   screenshot/record mode: demolish (X) every building at tick K
+       [--warmup SECS]   render before simulating (default 3 s when recording)
   no inputs: synthetic testutil arena.  --arena N: N synthetic 6-storey towers (perf test).
   coordinates are engine Z-up meters.";
 
 impl Args {
     pub fn parse() -> Result<Self, String> {
-        let mut a = Args { frames: 120, explode_frame: 10, width: 1600.0, height: 900.0, ..Default::default() };
+        let mut a = Args { frames: 120, explode_frame: 10, width: 1600.0, height: 900.0, record_every: 4, warmup: -1.0, ..Default::default() };
         let mut it = std::env::args().skip(1);
         while let Some(s) = it.next() {
             let mut val = || it.next().ok_or_else(|| format!("{s} needs a value"));
@@ -45,6 +58,10 @@ impl Args {
                 "--scenario" => a.scenario = Some(val()?.into()),
                 "--arena" => a.arena = Some(val()?.parse().map_err(|e| format!("--arena: {e}"))?),
                 "--screenshot" => a.screenshot = Some(val()?.into()),
+                "--record" => a.record = Some(val()?.into()),
+                "--record-every" => a.record_every = val()?.parse::<u32>().map_err(|e| format!("--record-every: {e}"))?.max(1),
+                "--warmup" => a.warmup = val()?.parse().map_err(|e| format!("--warmup: {e}"))?,
+                "--demolish-frame" => a.demolish_frame = Some(val()?.parse().map_err(|e| format!("--demolish-frame: {e}"))?),
                 "--frames" => a.frames = val()?.parse().map_err(|e| format!("--frames: {e}"))?,
                 "--explode" => {
                     let v = val()?;
@@ -57,6 +74,7 @@ impl Args {
                     })
                 }
                 "--explode-frame" => a.explode_frame = val()?.parse().map_err(|e| format!("--explode-frame: {e}"))?,
+                "--beam" => a.beam = Some(parse_vec::<6>(&val()?)?),
                 "--cam" => a.cam = Some(parse_vec::<3>(&val()?)?),
                 "--look" => a.look = Some(parse_vec::<3>(&val()?)?),
                 "--overlay" => a.overlays = val()?.split(',').map(|x| x.trim().to_lowercase()).collect(),
@@ -69,6 +87,9 @@ impl Args {
                 f if f.starts_with("--") => return Err(format!("unknown flag {f}\n{USAGE}")),
                 f => a.blds.push(f.into()),
             }
+        }
+        if a.warmup < 0.0 {
+            a.warmup = if a.record.is_some() { 3.0 } else { 0.0 };
         }
         Ok(a)
     }

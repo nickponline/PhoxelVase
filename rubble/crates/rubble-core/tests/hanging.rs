@@ -75,3 +75,24 @@ fn without_thaw_the_block_hangs() {
     let z = block_z(&w, b, block);
     assert!(z > 3.5, "with thaw disabled the frozen block stays in the air (z {z})");
 }
+
+/// The support does not get destroyed, it *detaches*: the columns are shot out, the slab
+/// becomes a falling cluster and the block that was frozen on it must come down too. The
+/// support check runs in the tick the slab turns dynamic, while the slab is still right under
+/// the block, so it must keep watching until that support has actually stayed put.
+/// The background sweep is disabled so it cannot paper over the miss.
+#[test]
+fn rubble_falls_when_its_support_detaches() {
+    let mut cfg = WorldConfig::default();
+    cfg.thaw_sweep_per_tick = 0;
+    let (mut w, b, _under, block) = setup(cfg);
+    run(&mut w, 4.0);
+    assert_eq!(w.building(b).state[block as usize], ChunkState::Frozen, "settled block should be frozen");
+    for c in 0..4 {
+        w.damage_chunk(b, c, 1e9);
+    }
+    run(&mut w, 8.0);
+    let z = block_z(&w, b, block);
+    assert!(z < 2.0, "block must come down with the slab it rests on, com z = {z}");
+}
+

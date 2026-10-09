@@ -1,0 +1,38 @@
+# GENERATED variant of ../kyoto.yaml: fracture cell_size x1.6 (coarse: fewer, larger chunks).
+# Same layout as the base spec for a given seed; only the fracture differs.
+name: kyoto_coarse
+preset: kyoto
+seed: 8
+blockout:
+  shape: rect
+  width: [11, 14]
+  depth: [8, 10]
+  floors: [1, 2]
+  roof: kyoto
+nodes:
+- floors: {}
+- exterior_walls:
+    bay_width: [1.8, 2.4]
+- rooms:
+    min_room: 7.0
+    tags: {washitsu: 0.6, engawa: 0.2, kitchen: 0.2}
+- stairs: {flight_width: 1.0}
+- openings:
+    windows:
+      style: [punched, round]
+      sill: 0.8
+      head: 2.0
+      width: [0.9, 1.4]
+- roofs:
+    kyoto:
+      pitch_deg: [36, 42]
+      eaves: 0.9
+      strips: 4
+fracture:
+  concrete: {cell_size: 1.76, edge_bias: 1.5}
+  brick: {cell_size: 1.28}
+  wood:
+    cell_size: 1.12
+    anisotropy: [3, 1]
+  metal: {cell_size: 1.92}
+  glass: {mode: shatter_on_hit}
