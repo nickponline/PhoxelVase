@@ -1,6 +1,13 @@
 # PhoxelVase
 
-Procedurally generated, pre-fractured buildings and a real-time destruction engine to knock them down.
+Physics engine focused on real-time destruction.
+
+## Run the viewer
+```sh
+cd rubble && cargo run --release -p rubble-viewer -- ../assets/buildings/office_1/building.bld
+```
+
+Press H in the viewer for the controls.
 
 ![office_1 demolished with X](recordings/office_1.gif)
 ![office_xcoarse_2 demolished with X](recordings/office_xcoarse_2.gif)
@@ -14,19 +21,7 @@ Procedurally generated, pre-fractured buildings and a real-time destruction engi
   Crates: `rubble-core` (engine), `rubble-stress` (solver), `rubble-format` (`.bld`),
   `rubble-viewer` (Bevy app), `rubble-sim` (headless runs and benchmarks), `rubble-py` (Python bindings).
 
-Building presets: office, apartment, warehouse, tower, house, kyoto. Free-form structures: eiffel,
-suspension_bridge, aqueduct, colossus. `assets/buildings/` holds three seeds of each, plus coarse and xcoarse fracture variants.
+Building presets: office, apartment, warehouse, tower, house, kyoto.
+Free-form structures: eiffel, suspension_bridge, aqueduct, colossus.
+
 `docs/explainer.html` is an illustrated walkthrough.
-
-## Run the viewer
-```sh
-cd rubble && cargo run --release -p rubble-viewer -- ../assets/buildings/office_1/building.bld
-```
-Press H in the viewer for the controls. `recordings/` has a demolition GIF for every office variant.
-
-## Tests
-```sh
-.venv/bin/python -m pytest -q bgen/tests rubble/crates/rubble-py/tests
-cd rubble && cargo test --release --workspace --exclude rubble-viewer
-cd rubble && cargo test --release -p rubble-core --test fuzz_hang -- --ignored   # randomized "nothing floats" check
-```
