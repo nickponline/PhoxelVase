@@ -161,6 +161,35 @@ impl RapierBackend {
     }
 }
 
+impl RapierBackend {
+    /// Kinematic Z-up capsule walker (the viewer's FPS mode; not part of the backend trait, it
+    /// never touches the simulation). `centre` is the capsule centre, `half_height` the half
+    /// length of its segment. Slides along walls, climbs stairs (autostep + slopes up to 50°)
+    /// and snaps down them; light debris is ignored so rubble cannot trap the walker.
+    /// Returns (translation actually applied, grounded afterwards).
+    pub fn move_capsule(&self, centre: Vec3, half_height: f32, radius: f32, desired: Vec3, dt: f32) -> (Vec3, bool) {
+        use rapier3d::control::{CharacterAutostep, CharacterLength, KinematicCharacterController};
+        let kcc = KinematicCharacterController {
+            up: Vec3::Z,
+            offset: CharacterLength::Absolute(0.02),
+            autostep: Some(CharacterAutostep {
+                max_height: CharacterLength::Absolute(0.3),
+                min_width: CharacterLength::Absolute(0.1),
+                include_dynamic_bodies: true,
+            }),
+            max_slope_climb_angle: 50f32.to_radians(),
+            min_slope_slide_angle: 55f32.to_radians(),
+            snap_to_ground: Some(CharacterLength::Absolute(0.3)),
+            ..Default::default()
+        };
+        let shape = Capsule::new_z(half_height, radius);
+        let filter = QueryFilter::default().groups(InteractionGroups::new(Group::GROUP_1, !LIGHT_DEBRIS, InteractionTestMode::And));
+        let qp = self.world.query_pipeline_with_filter(filter);
+        let m = kcc.move_shape(dt, &qp, &shape, &Pose::from_translation(centre), desired, |_| {});
+        (m.translation, m.grounded)
+    }
+}
+
 impl PhysicsBackend for RapierBackend {
     fn set_gravity(&mut self, g: Vec3) {
         self.world.gravity = g;

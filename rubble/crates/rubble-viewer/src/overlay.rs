@@ -10,6 +10,9 @@ use rubble_core::ChunkState;
 pub struct HelpText;
 #[derive(Component)]
 pub struct StatsText;
+/// Screen-centre aim mark, shown in walk mode.
+#[derive(Component)]
+pub struct Crosshair;
 /// A help-box text span.
 #[derive(Component, Clone, Copy)]
 pub enum HelpSpan {
@@ -32,6 +35,7 @@ enum Toggle {
     Tint,
     Stats,
     KeepDebris,
+    Walk,
 }
 
 /// (key, description, state). Rows without a state are plain actions.
@@ -41,6 +45,8 @@ const HELP_ROWS: &[(&str, &str, Option<Toggle>)] = &[
     ("RMB", "mouse look (hold)", None),
     ("WASD", "move", None),
     ("Q/E", "down/up", None),
+    ("M", "walk mode", Some(Toggle::Walk)),
+    ("Space", "jump (Shift run)", None),
     ("G", "demolish at cursor", None),
     ("X", "demolish", None),
     ("R", "reset", None),
@@ -55,7 +61,7 @@ const HELP_ROWS: &[(&str, &str, Option<Toggle>)] = &[
     ("H", "help", None),
 ];
 /// Help row after which the dynamic-tint legend is drawn.
-const TINT_ROW: usize = 13;
+const TINT_ROW: usize = 15;
 const _: () = assert!(matches!(HELP_ROWS[TINT_ROW].2, Some(Toggle::Tint)));
 /// Yellow cross drawn on chunks waiting out their collapse delay (part of the tint overlay).
 const DETACHING_COLOR: Color = Color::srgb(1.0, 1.0, 0.2);
@@ -149,9 +155,36 @@ pub fn spawn_text(commands: &mut Commands, ui_cam: Option<Entity>) {
         StatsText,
         Visibility::Hidden,
     )).id();
+    // two bars centred on the screen
+    let ch = commands
+        .spawn((
+            Node {
+                position_type: PositionType::Absolute,
+                width: percent(100.0),
+                height: percent(100.0),
+                justify_content: JustifyContent::Center,
+                align_items: AlignItems::Center,
+                ..default()
+            },
+            Visibility::Hidden,
+            Crosshair,
+        ))
+        .with_children(|p| {
+            let (len, th) = (14.0, 2.0);
+            p.spawn(Node { width: px(len), height: px(len), ..default() }).with_children(|b| {
+                for (l, t, w, h) in [(0.0, (len - th) * 0.5, len, th), ((len - th) * 0.5, 0.0, th, len)] {
+                    b.spawn((
+                        Node { position_type: PositionType::Absolute, left: px(l), top: px(t), width: px(w), height: px(h), ..default() },
+                        BackgroundColor(Color::srgba(1.0, 1.0, 1.0, 0.85)),
+                    ));
+                }
+            });
+        })
+        .id();
     if let Some(c) = ui_cam {
         commands.entity(h).insert(UiTargetCamera(c));
         commands.entity(st).insert(UiTargetCamera(c));
+        commands.entity(ch).insert(UiTargetCamera(c));
     }
 }
 
@@ -252,11 +285,13 @@ pub fn update_text(
     spec: Res<crate::scene::WorldSpec>,
     catalog: Res<crate::scene::Catalog>,
     ov: Res<Overlays>,
+    walker: Res<crate::camera::Walker>,
     rs: Res<RenderState>,
     time: Res<Time<Real>>,
-    mut help: Query<&mut Visibility, (With<HelpText>, Without<StatsText>)>,
+    mut help: Query<&mut Visibility, (With<HelpText>, Without<StatsText>, Without<Crosshair>)>,
+    mut crosshair: Query<&mut Visibility, (With<Crosshair>, Without<HelpText>, Without<StatsText>)>,
     mut legend: Query<&mut Node, With<HelpLegend>>,
-    mut stats: Query<(&mut Text, &mut Visibility), (With<StatsText>, Without<HelpText>)>,
+    mut stats: Query<(&mut Text, &mut Visibility), (With<StatsText>, Without<HelpText>, Without<Crosshair>)>,
     mut help_spans: Query<(&HelpSpan, &mut TextSpan, &mut TextColor)>,
     mut help_cache: Local<Option<(String, Vec<Option<bool>>)>>,
     mut fps: Local<f32>,
@@ -265,6 +300,9 @@ pub fn update_text(
 ) {
     let dt = time.delta_secs().max(1e-4);
     *fps = if *fps == 0.0 { 1.0 / dt } else { *fps + (1.0 / dt - *fps) * 0.05 };
+    if let Ok(mut v) = crosshair.single_mut() {
+        *v = if walker.on { Visibility::Inherited } else { Visibility::Hidden };
+    }
     if let Ok(mut v) = help.single_mut() {
         *v = if ov.help { Visibility::Inherited } else { Visibility::Hidden };
         if ov.help {
@@ -277,6 +315,7 @@ pub fn update_text(
                 Toggle::Tint => ov.sleep_tint,
                 Toggle::Stats => ov.stats,
                 Toggle::KeepDebris => ov.keep_debris,
+                Toggle::Walk => walker.on,
             };
             let states: Vec<Option<bool>> = HELP_ROWS.iter().map(|r| r.2.map(state)).collect();
             // only touch the spans when something visible changed

@@ -22,7 +22,7 @@ use bevy::light::CascadeShadowConfigBuilder;
 use bevy::prelude::*;
 use bevy::render::view::screenshot::{save_to_disk, Screenshot, ScreenshotCaptured};
 use bevy::window::{PresentMode, PrimaryWindow, WindowResolution};
-use camera::{camera_control, CamCtl};
+use camera::{camera_control, CamCtl, Walker};
 use coords::{to_bevy, to_engine};
 use render::{Materials, RenderState};
 use rubble_core::physics::PhysicsBackend;
@@ -262,6 +262,7 @@ fn main() {
     .insert_resource(overlays)
     .insert_resource(CursorHit::default())
     .insert_resource(Fx::default())
+    .insert_resource(Walker::default())
     .insert_resource(RenderState::default())
     .insert_resource(sim)
     .insert_resource(spec)
@@ -427,6 +428,7 @@ fn cycle_buildings(
     mut cams: Query<(&mut Transform, &mut CamCtl, Option<&mut DistanceFog>)>,
     mut windows: Query<&mut Window, With<PrimaryWindow>>,
     shard_q: Query<Entity, With<shards::Shard>>,
+    mut walker: ResMut<Walker>,
 ) {
     let delta = if keys.any_just_pressed([KeyCode::Equal, KeyCode::NumpadAdd]) {
         1
@@ -460,6 +462,7 @@ fn cycle_buildings(
         t0.elapsed().as_secs_f64() * 1e3
     );
     let (_, ext) = framing(&new_spec);
+    walker.on = false;
     if let Ok((mut xf, mut ctl, fog)) = cams.single_mut() {
         let (c, x) = camera_pose(&new_spec, None, None);
         *ctl = c;
@@ -488,10 +491,11 @@ fn cursor_pick(
     windows: Query<&Window, With<PrimaryWindow>>,
     cams: Query<(&Camera, &GlobalTransform)>,
     sim: Res<Sim>,
+    walker: Res<Walker>,
     mut hit: ResMut<CursorHit>,
 ) {
     hit.0 = None;
-    let Some(ray) = view_ray(&windows, &cams) else { return };
+    let Some(ray) = view_ray(&windows, &cams, walker.on) else { return };
     let o = to_engine(ray.0);
     let d = to_engine(ray.1);
     if let Some(h) = sim.world.phys.cast_ray(o.into(), d.into(), 2000.0, None) {
@@ -499,12 +503,13 @@ fn cursor_pick(
     }
 }
 
-/// Bevy-space (origin, dir) of the pick ray.
-fn view_ray(windows: &Query<&Window, With<PrimaryWindow>>, cams: &Query<(&Camera, &GlobalTransform)>) -> Option<(Vec3, Vec3)> {
+/// Bevy-space (origin, dir) of the pick ray: through the cursor, or the screen centre
+/// (crosshair) when `centred` (walk mode) or the cursor is outside the window.
+fn view_ray(windows: &Query<&Window, With<PrimaryWindow>>, cams: &Query<(&Camera, &GlobalTransform)>, centred: bool) -> Option<(Vec3, Vec3)> {
     let win = windows.single().ok()?;
     let (cam, gt) = cams.single().ok()?;
     let center = Vec2::new(win.width() * 0.5, win.height() * 0.5);
-    let p = win.cursor_position().unwrap_or(center);
+    let p = if centred { center } else { win.cursor_position().unwrap_or(center) };
     let r = cam.viewport_to_world(gt, p).ok()?;
     Some((r.origin, *r.direction))
 }
@@ -523,6 +528,7 @@ fn controls(
     mut fx: ResMut<Fx>,
     mut rs: ResMut<RenderState>,
     shard_q: Query<Entity, With<shards::Shard>>,
+    walker: Res<Walker>,
 ) {
     // toggles
     if keys.just_pressed(KeyCode::Digit1) {
@@ -574,7 +580,7 @@ fn controls(
     // fall side sideways relative to the view, left or right at random
     if keys.just_pressed(KeyCode::KeyX) {
         let seed = (sim.world.time * 1000.0) as u32 ^ sim.queued.len() as u32;
-        let view = view_ray(&windows, &cams).map_or([0.0, 1.0], |(_, d)| {
+        let view = view_ray(&windows, &cams, walker.on).map_or([0.0, 1.0], |(_, d)| {
             let e = to_engine(d);
             [e[0], e[1]]
         });
@@ -597,9 +603,14 @@ fn controls(
     sim.beam = None;
     fx.beam = None;
     if mouse.pressed(MouseButton::Left) {
-        if let Some((o, d)) = view_ray(&windows, &cams) {
+        if let Some((o, d)) = view_ray(&windows, &cams, walker.on) {
             sim.beam = Some((to_engine(o), to_engine(d)));
-            fx.beam = Some((o + d * 0.5 - Vec3::Y * 0.25, o + d * BEAM_RANGE));
+            // walk mode: from a "gun" at the lower right of the view
+            let muzzle = match cams.single() {
+                Ok((_, gt)) if walker.on => o + d * 0.5 + gt.right() * 0.15 - gt.up() * 0.15,
+                _ => o + d * 0.5 - Vec3::Y * 0.25,
+            };
+            fx.beam = Some((muzzle, o + d * BEAM_RANGE));
         }
     }
 }
