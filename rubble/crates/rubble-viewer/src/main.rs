@@ -16,6 +16,7 @@ mod render;
 mod scene;
 mod beam;
 mod demolish;
+mod effects;
 mod shards;
 
 use bevy::light::CascadeShadowConfigBuilder;
@@ -60,6 +61,12 @@ pub struct Sim {
     pub queued: Vec<(f32, Scheduled)>,
     /// (building, engine time): demolished buildings collapse without the warning delay until then
     pub hurry: Vec<(u32, f32)>,
+    /// breaks / hard landings since the effects system last ran
+    pub fx_events: Vec<effects::FxEvent>,
+    /// look for hard contacts each tick (particles on)
+    pub collect_impacts: bool,
+    /// collider pairs in contact last tick (only new contacts throw up debris)
+    touching: std::collections::HashSet<(u128, u128)>,
 }
 
 fn run_action(w: &mut EngineWorld, a: &Scheduled) {
@@ -90,6 +97,9 @@ impl Sim {
             beam: None,
             queued: vec![],
             hurry: vec![],
+            fx_events: vec![],
+            collect_impacts: false,
+            touching: Default::default(),
         }
         .with_centres()
     }
@@ -105,6 +115,28 @@ impl Sim {
             })
             .collect();
         self
+    }
+
+    /// Hard new contacts this tick -> `FxEvent::Impact` (resting contacts never repeat).
+    fn find_impacts(&mut self) {
+        let mut contacts = vec![];
+        self.world.phys.contacts(50.0, &mut contacts);
+        let mut touching = std::collections::HashSet::with_capacity(contacts.len());
+        let mut picked: Vec<[f32; 3]> = vec![];
+        for c in &contacts {
+            let key = (c.tag1.min(c.tag2), c.tag1.max(c.tag2));
+            touching.insert(key);
+            if c.impulse < effects::IMPACT_MIN || self.touching.contains(&key) || picked.len() >= effects::IMPACTS_PER_TICK {
+                continue;
+            }
+            let p = c.point.to_array();
+            let near = |q: &[f32; 3]| (q[0] - p[0]).powi(2) + (q[1] - p[1]).powi(2) + (q[2] - p[2]).powi(2) < effects::IMPACT_SPACING.powi(2);
+            if !picked.iter().any(near) && self.fx_events.len() < effects::MAX_FX_EVENTS {
+                picked.push(p);
+                self.fx_events.push(effects::FxEvent::Impact { pos: p, impulse: c.impulse });
+            }
+        }
+        self.touching = touching;
     }
 
     fn step(&mut self, spec: &WorldSpec, now: f64) {
@@ -131,11 +163,32 @@ impl Sim {
         let events = self.world.drain_events();
         let n = events.len();
         for e in events {
-            if let rubble_core::Event::ChunkShattered { building, chunk, .. } = e {
-                if self.world.buildings[building.0 as usize].glass(chunk as usize) {
-                    self.shattered.push((building.0, chunk));
+            use effects::FxEvent;
+            let fx = match e {
+                rubble_core::Event::ChunkShattered { building, chunk, pos, material } => {
+                    if self.world.buildings[building.0 as usize].glass(chunk as usize) {
+                        self.shattered.push((building.0, chunk));
+                        None
+                    } else {
+                        Some(FxEvent::Break { pos, material })
+                    }
+                }
+                rubble_core::Event::ChunkDestroyed { building, chunk, pos } => {
+                    let b = &self.world.buildings[building.0 as usize];
+                    (!b.glass(chunk as usize)).then(|| FxEvent::Break { pos, material: b.bld.chunks[chunk as usize].material })
+                }
+                _ => None,
+            };
+            if let Some(fx) = fx {
+                if self.fx_events.len() < effects::MAX_FX_EVENTS {
+                    self.fx_events.push(fx);
                 }
             }
+        }
+        if self.collect_impacts {
+            self.find_impacts();
+        } else {
+            self.touching.clear();
         }
         self.event_log.push_back((now, n));
         while self.event_log.front().is_some_and(|(t, _)| now - t > 1.0) {
@@ -168,6 +221,9 @@ pub struct Overlays {
     pub help: bool,
     /// engine `keep_debris` (applied to every world, so it survives reset and building switches)
     pub keep_debris: bool,
+    /// fancy lighting / particle effects (see `effects`)
+    pub lighting: bool,
+    pub particles: bool,
 }
 
 /// Engine-space hit under the cursor this frame (Bevy-space point for the camera).
@@ -232,7 +288,16 @@ fn main() {
             catalog.select_path(one);
         }
     }
-    let mut overlays = Overlays { help: true, keep_debris: sim.world.cfg.keep_debris, ..default() };
+    // effects default on interactively, off for screenshots / recordings (opt in with
+    // `--overlay lighting,particles`) so captures stay comparable
+    let shot_mode = args.screenshot.is_some() || args.record.is_some();
+    let mut overlays = Overlays {
+        help: true,
+        keep_debris: sim.world.cfg.keep_debris,
+        lighting: !shot_mode,
+        particles: !shot_mode,
+        ..default()
+    };
     for o in &args.overlays {
         match o.as_str() {
             "f1" | "graph" => overlays.graph = true,
@@ -241,11 +306,14 @@ fn main() {
             "f4" | "sleep" => overlays.sleep_tint = true,
             "f5" | "stats" => overlays.stats = true,
             "f6" | "debris" => overlays.keep_debris = true,
+            "f7" | "lighting" => overlays.lighting = true,
+            "f8" | "particles" => overlays.particles = true,
+            "nolighting" => overlays.lighting = false,
+            "noparticles" => overlays.particles = false,
             "nohelp" => overlays.help = false,
             _ => eprintln!("unknown overlay {o}"),
         }
     }
-    let shot_mode = args.screenshot.is_some();
     let mut app = App::new();
     app.add_plugins(DefaultPlugins.set(WindowPlugin {
         primary_window: Some(Window {
@@ -268,7 +336,7 @@ fn main() {
     .insert_resource(spec)
     .insert_resource(catalog)
     .insert_resource(ArgsRes(args.clone()))
-    .add_systems(Startup, (setup, shards::setup_shards, beam::setup_beam))
+    .add_systems(Startup, (setup, shards::setup_shards, beam::setup_beam, effects::setup_effects))
     .add_systems(
         Update,
         (
@@ -276,8 +344,10 @@ fn main() {
             cursor_pick,
             camera_control,
             controls,
+            effects::apply_lighting,
             render::sync_render,
             shards::update_shards,
+            effects::update_effects,
             beam::draw_beam,
             overlay::draw_overlays,
             overlay::update_text,
@@ -342,6 +412,8 @@ fn setup(
     let (ctl, xf) = camera_pose(&spec, args.0.cam, args.0.look);
     let mut cam = commands.spawn((
         Camera3d::default(),
+        // point-light shadow detail follows this camera (also when it renders offscreen)
+        bevy::camera::ShadowLodOrigin,
         xf,
         ctl,
         Projection::Perspective(PerspectiveProjection { fov: 60f32.to_radians(), far: 5000.0, ..default() }),
@@ -428,6 +500,7 @@ fn cycle_buildings(
     mut cams: Query<(&mut Transform, &mut CamCtl, Option<&mut DistanceFog>)>,
     mut windows: Query<&mut Window, With<PrimaryWindow>>,
     shard_q: Query<Entity, With<shards::Shard>>,
+    effect_q: Query<Entity, effects::EffectFilter>,
     mut walker: ResMut<Walker>,
 ) {
     let delta = if keys.any_just_pressed([KeyCode::Equal, KeyCode::NumpadAdd]) {
@@ -452,6 +525,7 @@ fn cycle_buildings(
     *sim = Sim::new(&new_spec);
     render::clear_entities(&mut commands, &mut rs);
     shards::clear_shards(&mut commands, &shard_q);
+    effects::clear_effects(&mut commands, &effect_q);
     rs.reset(&sim);
     fx.blasts.clear();
     println!(
@@ -528,6 +602,7 @@ fn controls(
     mut fx: ResMut<Fx>,
     mut rs: ResMut<RenderState>,
     shard_q: Query<Entity, With<shards::Shard>>,
+    effect_q: Query<Entity, effects::EffectFilter>,
     walker: Res<Walker>,
 ) {
     // toggles
@@ -550,6 +625,12 @@ fn controls(
     if keys.just_pressed(KeyCode::Digit6) {
         ov.keep_debris = !ov.keep_debris;
     }
+    if keys.just_pressed(KeyCode::Digit7) {
+        ov.lighting = !ov.lighting;
+    }
+    if keys.just_pressed(KeyCode::Digit8) {
+        ov.particles = !ov.particles;
+    }
     // every frame, so a fresh world (reset, next building) picks it up too; affects debris
     // created from now on
     sim.world.cfg.keep_debris = ov.keep_debris;
@@ -567,8 +648,9 @@ fn controls(
         *sim = Sim::new(&spec);
         render::clear_entities(&mut commands, &mut rs);
         shards::clear_shards(&mut commands, &shard_q);
+        effects::clear_effects(&mut commands, &effect_q);
         rs.reset(&sim);
-            fx.blasts.clear();
+        fx.blasts.clear();
     }
     if keys.just_pressed(KeyCode::KeyG) {
         if let Some(p) = hit.0 {

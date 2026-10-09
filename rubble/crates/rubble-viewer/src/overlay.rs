@@ -35,6 +35,8 @@ enum Toggle {
     Tint,
     Stats,
     KeepDebris,
+    Lighting,
+    Particles,
     Walk,
 }
 
@@ -58,6 +60,8 @@ const HELP_ROWS: &[(&str, &str, Option<Toggle>)] = &[
     ("4", "dynamic tint", Some(Toggle::Tint)),
     ("5", "stats", Some(Toggle::Stats)),
     ("6", "keep debris", Some(Toggle::KeepDebris)),
+    ("7", "lighting", Some(Toggle::Lighting)),
+    ("8", "particles", Some(Toggle::Particles)),
     ("H", "help", None),
 ];
 /// Help row after which the dynamic-tint legend is drawn.
@@ -215,7 +219,8 @@ pub fn draw_overlays(
         b.2 += dt;
         b.2 < 0.6
     });
-    for (p, r, age) in &fx.blasts {
+    // (the particle fireball replaces the wireframe when particles are on)
+    for (p, r, age) in fx.blasts.iter().filter(|_| !ov.particles) {
         if *age >= 0.0 {
             let k = age / 0.6;
             gizmos.sphere(Isometry3d::from_translation(*p), r * (0.3 + 0.7 * k), Color::srgba(1.0, 0.6, 0.1, 1.0 - k));
@@ -316,6 +321,8 @@ pub fn update_text(
                 Toggle::Stats => ov.stats,
                 Toggle::KeepDebris => ov.keep_debris,
                 Toggle::Walk => walker.on,
+                Toggle::Lighting => ov.lighting,
+                Toggle::Particles => ov.particles,
             };
             let states: Vec<Option<bool>> = HELP_ROWS.iter().map(|r| r.2.map(state)).collect();
             // only touch the spans when something visible changed

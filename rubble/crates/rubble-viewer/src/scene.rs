@@ -40,7 +40,7 @@ fn parse_vec<const N: usize>(s: &str) -> Result<[f32; N], String> {
 
 pub const USAGE: &str = "usage: rubble-viewer [FILE.bld ...] [--scenario S.yaml] [--arena N]
        [--screenshot OUT.png --frames N [--explode x,y,z,r[,damage]] [--explode-frame K]
-        [--beam x,y,z,dx,dy,dz] [--cam x,y,z] [--look x,y,z] [--overlay f1,f2,f3,f4,f5] [--size WxH]]
+        [--beam x,y,z,dx,dy,dz] [--cam x,y,z] [--look x,y,z] [--overlay f1,..,f8|lighting|particles|nolighting|noparticles] [--size WxH]]
        [--record DIR --frames N [--record-every K]]   frames DIR/frame_00000.png ... every K ticks (default 4)
        [--demolish-frame K]   screenshot/record mode: demolish (X) every building at tick K
        [--warmup SECS]   render before simulating (default 3 s when recording)
