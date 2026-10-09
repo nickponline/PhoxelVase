@@ -309,6 +309,10 @@ pub struct World {
     ground_check_catches: usize,
     // scratch
     contacts: Vec<ContactImpulse>,
+    /// collider pairs (sorted tags) in contact last tick, for `Event::Impact`
+    touching: Vec<(u128, u128)>,
+    /// where the action is watched from (`set_focus`): debris near it is kept longest
+    focus: Vec<Vec3>,
     scratch_u32: Vec<u32>,
     scratch_hits: Vec<(ClusterKey, u32, Vec3)>,
 }
@@ -368,6 +372,8 @@ impl World {
             contacts: vec![],
             scratch_u32: vec![],
             scratch_hits: vec![],
+            touching: vec![],
+            focus: vec![],
         }
     }
 
@@ -444,6 +450,19 @@ impl World {
             p.timer = 0.0;
         }
     }
+    /// Points the destruction is watched from (cameras, players); empty = none. When moving
+    /// pieces have to be dropped to stay within the budgets, small debris far from every focus
+    /// point goes first, and far debris despawns sooner (`WorldConfig::lod_far`). Call it
+    /// whenever the viewpoint moves; big pieces are never dropped early for being far away.
+    pub fn set_focus(&mut self, points: &[[f32; 3]]) {
+        self.focus = points.iter().map(|&p| v3(p)).collect();
+    }
+
+    /// Distance from `p` to the nearest focus point (infinite without focus).
+    fn focus_dist(&self, p: Vec3) -> f32 {
+        self.focus.iter().map(|f| (*f - p).length()).fold(f32::INFINITY, f32::min)
+    }
+
     pub fn drain_events(&mut self) -> Vec<Event> {
         std::mem::take(&mut self.events)
     }
@@ -1121,6 +1140,9 @@ impl World {
         let mut vel = (Vec3::ZERO, Vec3::ZERO);
         let com_local = v3(self.buildings[b as usize].bld.chunks[cu].com);
         let com = pose.transform_point(com_local);
+        // at the piece cap, debris in view of a focus point may still be made: the budgets drop
+        // far debris for it at the end of the tick
+        let in_view = !self.focus.is_empty() && self.focus_dist(com) <= self.cfg.lod_far;
         match st {
             ChunkState::InCluster(k) => {
                 if let Some(cl) = self.clusters.get_mut(k) {
@@ -1162,7 +1184,7 @@ impl World {
             && ch.flags & F_NO_DEBRIS == 0
             && ch.volume >= min_vol
             && (keep || ch.volume <= self.cfg.debris_max_volume)
-            && self.clusters.len() < max_clusters
+            && (in_view || self.clusters.len() < max_clusters)
             && self.clusters.values().map(|c| c.chunks.len()).sum::<usize>() < self.cfg.max_chunks_in_flight;
         if can_debris {
             if !matches!(st, ChunkState::InCluster(_)) {
@@ -1852,6 +1874,7 @@ impl World {
         self.contacts.clear();
         let mut contacts = std::mem::take(&mut self.contacts);
         self.phys.contacts(1.0, &mut contacts);
+        self.impact_events(&contacts);
         // (cluster, chunk, impulse vector on the cluster)
         let mut hits = std::mem::take(&mut self.scratch_hits);
         hits.clear();
@@ -2156,6 +2179,84 @@ impl World {
         true
     }
 
+    /// `Event::Impact` for collider pairs that touch this tick but did not last tick, with a total
+    /// impulse of at least `impact_event_min` (hardest `impact_events_max` of them).
+    fn impact_events(&mut self, contacts: &[ContactImpulse]) {
+        let min = self.cfg.impact_event_min;
+        if min <= 0.0 {
+            self.touching.clear();
+            return;
+        }
+        // per pair (sorted tags): impulse, impulse-weighted point, a normal, the moving side's (tag, sub)
+        struct Pair {
+            key: (u128, u128),
+            j: f32,
+            p: Vec3,
+            n: Vec3,
+            mover: (u128, Option<u32>, Vec3),
+        }
+        let mut pairs: Vec<Pair> = Vec::with_capacity(contacts.len());
+        for ct in contacts {
+            let key = (ct.tag1.min(ct.tag2), ct.tag1.max(ct.tag2));
+            // `normal` points out of collider 1; report it pointing at the moving side
+            let (mover, n) = if tag_kind(ct.tag1) == KIND_CLUSTER {
+                ((ct.tag1, ct.sub1, ct.point), -ct.normal)
+            } else {
+                ((ct.tag2, ct.sub2, ct.point), ct.normal)
+            };
+            pairs.push(Pair { key, j: ct.impulse, p: ct.point * ct.impulse, n, mover });
+        }
+        pairs.sort_by_key(|p| p.key);
+        let mut merged: Vec<Pair> = Vec::with_capacity(pairs.len());
+        for q in pairs {
+            match merged.last_mut() {
+                Some(m) if m.key == q.key => {
+                    m.j += q.j;
+                    m.p += q.p;
+                }
+                _ => merged.push(q),
+            }
+        }
+        let prev = std::mem::take(&mut self.touching);
+        let mut out: Vec<(f32, Event)> = vec![];
+        for m in &merged {
+            if m.j < min || prev.binary_search(&m.key).is_ok() {
+                continue;
+            }
+            let (tag, sub, at) = m.mover;
+            if tag_kind(tag) != KIND_CLUSTER {
+                continue; // static against static: nothing moved
+            }
+            let Some(cl) = self.clusters.get(tag_cluster(tag)) else { continue };
+            let chunk = match sub {
+                Some(s) if (s as usize) < cl.chunks.len() => Some(cl.chunks[s as usize]),
+                _ => self.resolve_hit(tag, at).map(|(_, c)| c),
+            };
+            let Some(chunk) = chunk else { continue };
+            let other = if m.key.0 == tag { m.key.1 } else { m.key.0 };
+            let other_mass = (tag_kind(other) == KIND_CLUSTER)
+                .then(|| self.clusters.get(tag_cluster(other)).map(|c| c.mass))
+                .flatten()
+                .unwrap_or(f32::INFINITY);
+            let mass = cl.mass.min(other_mass).max(1e-3);
+            let bd = &self.buildings[cl.building as usize];
+            out.push((
+                m.j,
+                Event::Impact {
+                    building: BuildingId(cl.building),
+                    pos: a3(m.p / m.j),
+                    normal: a3(m.n.normalize_or_zero()),
+                    impulse: m.j,
+                    speed: m.j / mass,
+                    material: bd.bld.chunks[chunk as usize].material,
+                },
+            ));
+        }
+        self.touching = merged.into_iter().map(|m| m.key).collect();
+        out.sort_by(|a, b| b.0.total_cmp(&a.0));
+        self.events.extend(out.into_iter().take(self.cfg.impact_events_max).map(|(_, e)| e));
+    }
+
     /// Impact stress (input side): a hard landing decelerates the whole cluster by `dv` within
     /// roughly `impact_duration`; every chunk's inertial load `m·dv/impact_duration` must flow
     /// through the bonds into the chunks touching the ground. The flow is solved with the
@@ -2239,9 +2340,13 @@ impl World {
     fn settle(&mut self, dt: f32) {
         let mut freeze = vec![];
         let mut despawn = vec![];
+        let (far, far_ttl) = (self.cfg.lod_far, self.cfg.lod_far_ttl.clamp(0.0, 1.0));
+        let focus = std::mem::take(&mut self.focus);
         for (k, cl) in self.clusters.iter_mut() {
             let s = self.phys.body_state(cl.body);
             cl.age += dt;
+            // small debris far from every focus point counts its age faster (no focus: never)
+            let far_away = !focus.is_empty() && focus.iter().all(|f| (*f - s.world_com).length() > far);
             let resting = s.sleeping || (s.linvel.length() < self.cfg.rest_lin_vel && s.angvel.length() < self.cfg.rest_ang_vel);
             cl.rest_time = if resting { cl.rest_time + dt } else { 0.0 };
             let big = !cl.debris && cl.mass >= self.cfg.freeze_min_mass;
@@ -2255,7 +2360,9 @@ impl World {
                 && !self.phys.touches_moving_dynamic(cl.body, self.cfg.rest_lin_vel, self.cfg.rest_ang_vel)
             {
                 freeze.push(k);
-            } else if !big && cl.age >= if self.cfg.keep_debris { self.cfg.keep_debris_max_age } else { self.cfg.debris_ttl } {
+            } else if !big
+                && cl.age >= if self.cfg.keep_debris { self.cfg.keep_debris_max_age } else { self.cfg.debris_ttl } * if far_away { far_ttl } else { 1.0 }
+            {
                 despawn.push(k);
             } else if big && cl.age >= self.cfg.max_dynamic_time {
                 freeze.push(k);
@@ -2263,6 +2370,7 @@ impl World {
                 despawn.push(k);
             }
         }
+        self.focus = focus;
         for k in freeze {
             self.freeze_cluster(k);
         }
@@ -2277,9 +2385,21 @@ impl World {
         if over == 0 && in_flight <= self.cfg.max_chunks_in_flight {
             return;
         }
-        let mut order: Vec<(f32, f32, ClusterKey)> = self.clusters.iter().map(|(k, c)| (c.mass, -c.age, k)).collect();
-        order.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.total_cmp(&b.1)));
-        for (_, _, k) in order {
+        // lightest (then oldest) first. With a focus: small debris first, farthest first, then
+        // the rest as without (big pieces are never dropped early for being far away)
+        let min_mass = self.cfg.freeze_min_mass;
+        let focused = !self.focus.is_empty();
+        let mut order: Vec<(u8, f32, f32, f32, ClusterKey)> = self
+            .clusters
+            .iter()
+            .map(|(k, c)| {
+                let small = c.debris || c.mass < min_mass;
+                let far = if focused && small { -self.focus_dist(self.phys.body_state(c.body).world_com) } else { 0.0 };
+                ((focused && !small) as u8, far, c.mass, -c.age, k)
+            })
+            .collect();
+        order.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.total_cmp(&b.1)).then(a.2.total_cmp(&b.2)).then(a.3.total_cmp(&b.3)));
+        for (_, _, _, _, k) in order {
             if over == 0 && in_flight <= self.cfg.max_chunks_in_flight {
                 break;
             }
@@ -2440,7 +2560,12 @@ impl World {
             self.sweep_cursor = (bi, ci + 1);
             scanned += 1;
             if self.buildings[bi].state[ci] == ChunkState::Frozen {
-                seeds.push((bi as u32, ci as u32));
+                // known to rest on something static: only a removal (handled above, through
+                // `support_lost`) can change that. Still counts against the budget, so the
+                // sweep reaches the same chunks on the same ticks as without the shortcut.
+                if !self.buildings[bi].support_static[ci] {
+                    seeds.push((bi as u32, ci as u32));
+                }
                 budget -= 1;
             }
         }
@@ -2455,7 +2580,13 @@ impl World {
                 checked.insert((b, g));
             }
             match self.group_supported(b, &group) {
-                Support::Solid => continue,
+                Support::Solid => {
+                    let bd = &mut self.buildings[b as usize];
+                    for &g in &group {
+                        bd.support_static[g as usize] = true;
+                    }
+                    continue;
+                }
                 Support::Transient => {
                     // resting on something that may move away: look again next tick
                     self.support_watch.push((b, c));
@@ -2501,6 +2632,23 @@ impl World {
         let com_margin = com_margin.filter(|_| chunks.len() > 1);
         let mut patches: Vec<[f64; 2]> = vec![];
         let bd = &self.buildings[b as usize];
+        // horizontal centre of mass (only needed with a margin)
+        let com = com_margin.and_then(|_| {
+            let (mut m, mut cx, mut cy) = (0f64, 0f64, 0f64);
+            for &c in chunks {
+                let ch = &bd.bld.chunks[c as usize];
+                let w = pose_of(c).transform_point(v3(ch.com));
+                m += ch.mass as f64;
+                cx += ch.mass as f64 * w.x as f64;
+                cy += ch.mass as f64 * w.y as f64;
+            }
+            (m > 0.0).then(|| [cx / m, cy / m])
+        });
+        // The footprint of the resting chunks only grows, so once part of it holds the centre
+        // of mass the whole of it does: test it as it grows (at 4, 8, 16, ... resting chunks)
+        // and stop probing the rest. Same answer as testing once at the end, without probing
+        // every chunk of a big flat group.
+        let mut next_check = 4usize;
         // lowest chunks first: they are the ones that rest on something; stop at the first solid hit
         let mut order: Vec<(f32, u32)> =
             chunks.iter().map(|&c| (pose_of(c).transform_point(v3(bd.bld.chunks[c as usize].aabb_min)).z, c)).collect();
@@ -2560,18 +2708,18 @@ impl World {
                     [hi.x as f64, hi.y as f64],
                     [lo.x as f64, hi.y as f64],
                 ]);
+                if let (Some(margin), Some(com)) = (com_margin, com) {
+                    if patches.len() / 4 >= next_check {
+                        next_check *= 2;
+                        if crate::building::dist_outside_hull(&mut patches, com) <= margin as f64 {
+                            return Support::Solid;
+                        }
+                    }
+                }
             }
         }
-        if let (Some(margin), false) = (com_margin, patches.is_empty()) {
-            let (mut m, mut cx, mut cy) = (0f64, 0f64, 0f64);
-            for &c in chunks {
-                let ch = &bd.bld.chunks[c as usize];
-                let w = pose_of(c).transform_point(v3(ch.com));
-                m += ch.mass as f64;
-                cx += ch.mass as f64 * w.x as f64;
-                cy += ch.mass as f64 * w.y as f64;
-            }
-            if m > 0.0 && crate::building::dist_outside_hull(&mut patches, [cx / m, cy / m]) <= margin as f64 {
+        if let (Some(margin), Some(com), false) = (com_margin, com, patches.is_empty()) {
+            if crate::building::dist_outside_hull(&mut patches, com) <= margin as f64 {
                 return Support::Solid;
             }
         }
@@ -2686,6 +2834,7 @@ impl World {
                 continue;
             }
             bd.state[cu] = ChunkState::Frozen;
+            bd.support_static[cu] = false;
             bd.chunk_pose[cu] = s.pose;
             let (h, aabb) = self.phys.add_static_collider(bd.shapes[cu].clone(), s.pose, chunk_tag(b, c));
             bd.collider[cu] = Some(h);
@@ -2711,5 +2860,138 @@ impl World {
             }
         }
         self.events.push(Event::ClusterDespawned { cluster: cluster_id(k) });
+    }
+}
+
+// ---------------------------------------------------------------------- persistent damage
+
+impl World {
+    /// Capture building `b`'s damage (see [`crate::save`]). Pieces still in flight are saved
+    /// as rubble where they are now; a pending collapse is saved as the standing structure it
+    /// still is (it collapses again after a restore, the joints that cause it being broken).
+    pub fn save_damage(&self, b: BuildingId) -> crate::save::DamageState {
+        use crate::save::*;
+        let bd = &self.buildings[b.0 as usize];
+        let inv = bd.pose.inverse();
+        let mut out = DamageState {
+            version: DAMAGE_STATE_VERSION,
+            chunks: bd.n_chunks() as u32,
+            edges: bd.edge_alive.len() as u32,
+            ..Default::default()
+        };
+        // rubble groups keyed by their exact relative pose
+        let mut groups: Vec<(Pose, Vec<u32>)> = vec![];
+        let mut add_rubble = |c: u32, world: Pose| {
+            let rel = inv * world;
+            match groups.iter_mut().find(|(p, _)| *p == rel) {
+                Some((_, v)) => v.push(c),
+                None => groups.push((rel, vec![c])),
+            }
+        };
+        for c in 0..bd.n_chunks() {
+            let cu = c as u32;
+            match bd.state[c] {
+                ChunkState::Gone => out.gone.push(cu),
+                ChunkState::Frozen => add_rubble(cu, bd.chunk_pose[c]),
+                ChunkState::InCluster(k) => match self.clusters.get(k) {
+                    Some(cl) => add_rubble(cu, self.phys.body_state(cl.body).pose),
+                    None => out.gone.push(cu),
+                },
+                ChunkState::Static | ChunkState::Detaching => {}
+            }
+            if !matches!(bd.state[c], ChunkState::Gone) && bd.hp[c] < bd.hp_max[c] {
+                out.hp.push((cu, bd.hp[c]));
+            }
+        }
+        for (e, &alive) in bd.edge_alive.iter().enumerate() {
+            if !alive {
+                out.broken.push(e as u32);
+            } else if bd.edge_health[e] < bd.edge_max_health[e] {
+                out.edge_health.push((e as u32, bd.edge_health[e]));
+            }
+        }
+        out.rubble = groups
+            .into_iter()
+            .map(|(p, chunks)| RubbleGroup { pos: p.translation.to_array(), rot: p.rotation.to_array(), chunks })
+            .collect();
+        out
+    }
+
+    /// Apply a saved [`crate::save::DamageState`] to building `b`, which must be intact (as
+    /// loaded). No events or debris: destroyed chunks are simply gone and rubble lies where it
+    /// was saved, frozen (its support is checked as usual). Errors if the state does not fit.
+    pub fn restore_damage(&mut self, b: BuildingId, state: &crate::save::DamageState) -> Result<(), String> {
+        use crate::save::*;
+        let bi = b.0;
+        let bd = self.buildings.get(bi as usize).ok_or("no such building")?;
+        if state.version != DAMAGE_STATE_VERSION {
+            return Err(format!("damage state version {} (expected {DAMAGE_STATE_VERSION})", state.version));
+        }
+        if state.chunks as usize != bd.n_chunks() || state.edges as usize != bd.edge_alive.len() {
+            return Err(format!(
+                "damage state is for a building of {} chunks / {} joints, this one has {} / {}",
+                state.chunks,
+                state.edges,
+                bd.n_chunks(),
+                bd.edge_alive.len()
+            ));
+        }
+        if bd.state.iter().any(|s| *s != ChunkState::Static) || bd.edge_alive.iter().any(|a| !a) {
+            return Err("restore_damage needs an intact building (as loaded)".into());
+        }
+        let n = bd.n_chunks() as u32;
+        let m = bd.edge_alive.len() as u32;
+        let bad = |c: u32| c >= n;
+        if state.gone.iter().any(|&c| bad(c))
+            || state.hp.iter().any(|&(c, _)| bad(c))
+            || state.rubble.iter().any(|g| g.chunks.iter().any(|&c| bad(c)))
+            || state.broken.iter().chain(state.edge_health.iter().map(|(e, _)| e)).any(|&e| e >= m)
+        {
+            return Err("damage state refers to chunks or joints this building does not have".into());
+        }
+        // joints and hit points
+        let bd = &mut self.buildings[bi as usize];
+        for &e in &state.broken {
+            bd.edge_alive[e as usize] = false;
+            let [ea, eb] = bd.edge_ab[e as usize];
+            bd.dirty.push(ea);
+            bd.dirty.push(eb);
+        }
+        for &(e, h) in &state.edge_health {
+            bd.edge_health[e as usize] = h;
+        }
+        for &(c, hp) in &state.hp {
+            bd.hp[c as usize] = hp;
+        }
+        bd.topo_changed = true;
+        bd.stress_active = true;
+        // destroyed chunks
+        for &c in &state.gone {
+            self.drop_static_collider(bi, c);
+            let bd = &mut self.buildings[bi as usize];
+            bd.state[c as usize] = ChunkState::Gone;
+        }
+        // rubble, frozen where it was saved
+        let base = self.buildings[bi as usize].pose;
+        for g in &state.rubble {
+            let rel = Pose::from_parts(Vec3::from(g.pos), Quat::from_array(g.rot));
+            let pose = base * rel;
+            for &c in &g.chunks {
+                self.drop_static_collider(bi, c);
+                let bd = &mut self.buildings[bi as usize];
+                let cu = c as usize;
+                bd.state[cu] = ChunkState::Frozen;
+                bd.support_static[cu] = false;
+                bd.chunk_pose[cu] = pose;
+                let (h, aabb) = self.phys.add_static_collider(bd.shapes[cu].clone(), pose, chunk_tag(bi, c));
+                bd.collider[cu] = Some(h);
+                bd.collider_aabb[cu] = aabb;
+            }
+            if let Some(&c) = g.chunks.first() {
+                self.support_watch.push((bi, c));
+            }
+        }
+        self.needs_sync = true;
+        Ok(())
     }
 }

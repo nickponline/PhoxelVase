@@ -55,6 +55,10 @@ pub struct Building {
     pub edge_max_health: Vec<f32>,
     // mutable SoA
     pub state: Vec<ChunkState>,
+    /// frozen chunk whose group was last found resting on something static (building, frozen
+    /// rubble, ground): only removing that can take its support away, and every removal
+    /// re-checks what is around it, so the round-robin support sweep skips it
+    pub support_static: Vec<bool>,
     pub hp: Vec<f32>,
     /// initial (max) hp per chunk (compact copy of `bld.chunks[c].hp`)
     pub hp_max: Vec<f32>,
@@ -195,6 +199,7 @@ impl Building {
             edge_health: edge_max_health.clone(),
             edge_max_health,
             state: vec![ChunkState::Static; n],
+            support_static: vec![false; n],
             hp: bld.chunks.iter().map(|c| c.hp).collect(),
             hp_max: bld.chunks.iter().map(|c| c.hp).collect(),
             chunk_pose: vec![pose; n],

@@ -2,16 +2,15 @@
 //!
 //! * **Lighting** (key 7): HDR + bloom, SSAO with TAA, screen-space contact shadows, 4K shadow
 //!   cascades, a low golden-hour sun with volumetric light shafts through a fog volume over the
-//!   scene, a sun glow in the distance fog, and point lights: a flickering, shadow-casting one
-//!   where the beam hits and short flashes on explosions.
-//! * **Particles** (key 8): sparks where the beam cuts, debris bits when chunks break or heavy
-//!   pieces land hard, and flames (soft camera-facing sprites), sparks and debris on explosions.
+//!   scene, a sun glow in the distance fog, and short point-light flashes on explosions.
+//! * **Particles** (key 8): debris bits when chunks break or heavy pieces land hard, and flames
+//!   (soft camera-facing sprites), sparks and debris on explosions.
 //!
 //! Particles live in engine space (Z-up) and advance with engine ticks like the glass shards, so
 //! they pause with the simulation and are reproducible in screenshot mode.
 use crate::coords::{to_bevy, to_engine};
 use crate::scene::WorldSpec;
-use crate::{Fx, Overlays, Sim, BEAM_RADIUS, BEAM_RANGE, DT};
+use crate::{Fx, Overlays, Sim, DT};
 use bevy::anti_alias::taa::TemporalAntiAliasing;
 use bevy::camera::Hdr;
 use bevy::light::{DirectionalLightShadowMap, FogVolume, NotShadowCaster, VolumetricFog, VolumetricLight};
@@ -89,8 +88,6 @@ pub struct Flash {
     peak: f32,
 }
 
-#[derive(Component)]
-pub struct BeamLight;
 #[derive(Component)]
 pub struct SceneFog;
 
@@ -179,19 +176,6 @@ pub fn setup_effects(
     });
     commands.insert_resource(EffectState { tick: 0, rng: 0x2545_f491, live: 0 });
     commands.insert_resource(DirectionalLightShadowMap { size: 2048 });
-    commands.spawn((
-        PointLight {
-            color: Color::srgb(1.0, 0.7, 0.35),
-            intensity: 0.0,
-            range: 25.0,
-            radius: 0.1,
-            shadow_maps_enabled: true,
-            ..default()
-        },
-        Transform::default(),
-        Visibility::Hidden,
-        BeamLight,
-    ));
     commands.spawn((
         FogVolume { density_factor: 0.004, absorption: 0.1, scattering: 0.3, scattering_asymmetry: 0.7, ..default() },
         fog_transform(&spec),
@@ -372,14 +356,12 @@ pub fn update_effects(
     fx: Res<Fx>,
     assets: Res<EffectAssets>,
     mut st: ResMut<EffectState>,
-    mut parts: Query<(Entity, &mut Particle, &mut Transform, &mut MeshMaterial3d<StandardMaterial>), Without<BeamLight>>,
-    mut flashes: Query<(Entity, &mut Flash, &mut PointLight), Without<BeamLight>>,
-    mut beam_light: Query<(&mut PointLight, &mut Transform, &mut Visibility), (With<BeamLight>, Without<Particle>)>,
-    cams: Query<&Transform, (With<Camera3d>, Without<Particle>, Without<BeamLight>)>,
+    mut parts: Query<(Entity, &mut Particle, &mut Transform, &mut MeshMaterial3d<StandardMaterial>)>,
+    mut flashes: Query<(Entity, &mut Flash, &mut PointLight)>,
+    cams: Query<&Transform, (With<Camera3d>, Without<Particle>)>,
 ) {
     let dt = time.delta_secs();
     let events = std::mem::take(&mut sim.fx_events);
-    sim.collect_impacts = ov.particles;
     let ticks = sim.world.tick.saturating_sub(st.tick).min(30) as u32;
     st.tick = sim.world.tick;
     let ground = sim.ground.unwrap_or(-1e9);
@@ -397,30 +379,7 @@ pub fn update_effects(
         }
     }
 
-    // beam: where it is cutting. It bores a clean tunnel of `BEAM_RADIUS` along its line, so a
-    // ray down the middle soon finds nothing; a slightly fatter sphere finds the tunnel's rim.
-    let beam_hit = sim.beam.and_then(|(o, d)| {
-        let d = EVec3::from(d).normalize_or_zero();
-        sim.world.phys.cast_sphere(o.into(), d * BEAM_RANGE, BEAM_RADIUS + 0.2).map(|h| {
-            let p = EVec3::from(o) + d * (h.toi * BEAM_RANGE + BEAM_RADIUS);
-            let n = if h.normal.dot(d) > 0.0 { -h.normal } else { h.normal };
-            (Vec3::from(p.to_array()), Vec3::from(n.to_array()), Vec3::from(d.to_array()))
-        })
-    });
-
     // ---- lights
-    if let Ok((mut l, mut xf, mut v)) = beam_light.single_mut() {
-        match beam_hit {
-            Some((p, n, _)) if ov.lighting => {
-                let t = time.elapsed_secs();
-                let flicker = 0.75 + 0.25 * (t * 53.0).sin() * (t * 31.0).cos();
-                l.intensity = 600_000.0 * flicker;
-                xf.translation = to_bevy((p + n * 0.4).to_array());
-                *v = Visibility::Inherited;
-            }
-            _ => *v = Visibility::Hidden,
-        }
-    }
     let mut n_flash = 0;
     for (e, mut f, mut l) in &mut flashes {
         f.age += dt;
@@ -491,16 +450,6 @@ pub fn update_effects(
             let v = st.dir(Vec3::Z) * st.range(5.0, 14.0);
             let size = st.range(0.08, 0.2);
             spawn.bit(&mut st, 0, p, v, size, floor);
-        }
-    }
-    if let Some((p, n, d)) = beam_hit {
-        // sparks spray off the surface, mostly back towards the shooter
-        let floor = floor_below(p);
-        let refl = (d - 2.0 * d.dot(n) * n).normalize_or_zero();
-        for _ in 0..ticks * 3 {
-            let v = (refl * 0.6 + st.dir(n) * 0.8).normalize_or_zero() * st.range(3.0, 9.0);
-            let life = st.range(0.25, 0.7);
-            spawn.spark(&mut st, p + n * 0.05, v, life, floor);
         }
     }
     for ev in events {

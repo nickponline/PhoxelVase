@@ -1,0 +1,60 @@
+--- a/rubble/crates/rubble-core/src/building.rs	2026-10-08 18:53:20
++++ b/rubble/crates/rubble-core/src/building.rs	2026-10-09 01:26:51
+@@ -55,6 +55,10 @@
+     pub edge_max_health: Vec<f32>,
+     // mutable SoA
+     pub state: Vec<ChunkState>,
++    /// frozen chunk whose group was last found resting on something static (building, frozen
++    /// rubble, ground): only removing that can take its support away, and every removal
++    /// re-checks what is around it, so the round-robin support sweep skips it
++    pub support_static: Vec<bool>,
+     pub hp: Vec<f32>,
+     /// initial (max) hp per chunk (compact copy of `bld.chunks[c].hp`)
+     pub hp_max: Vec<f32>,
+@@ -195,6 +199,7 @@
+             edge_health: edge_max_health.clone(),
+             edge_max_health,
+             state: vec![ChunkState::Static; n],
++            support_static: vec![false; n],
+             hp: bld.chunks.iter().map(|c| c.hp).collect(),
+             hp_max: bld.chunks.iter().map(|c| c.hp).collect(),
+             chunk_pose: vec![pose; n],
+--- a/rubble/crates/rubble-core/src/world.rs	2026-10-09 01:51:20
++++ b/rubble/crates/rubble-core/src/world.rs	2026-10-09 01:51:20
+@@ -2522,7 +2522,12 @@
+             self.sweep_cursor = (bi, ci + 1);
+             scanned += 1;
+             if self.buildings[bi].state[ci] == ChunkState::Frozen {
+-                seeds.push((bi as u32, ci as u32));
++                // known to rest on something static: only a removal (handled above, through
++                // `support_lost`) can change that. Still counts against the budget, so the
++                // sweep reaches the same chunks on the same ticks as without the shortcut.
++                if !self.buildings[bi].support_static[ci] {
++                    seeds.push((bi as u32, ci as u32));
++                }
+                 budget -= 1;
+             }
+         }
+@@ -2537,7 +2542,13 @@
+                 checked.insert((b, g));
+             }
+             match self.group_supported(b, &group) {
+-                Support::Solid => continue,
++                Support::Solid => {
++                    let bd = &mut self.buildings[b as usize];
++                    for &g in &group {
++                        bd.support_static[g as usize] = true;
++                    }
++                    continue;
++                }
+                 Support::Transient => {
+                     // resting on something that may move away: look again next tick
+                     self.support_watch.push((b, c));
+@@ -2785,6 +2796,7 @@
+                 continue;
+             }
+             bd.state[cu] = ChunkState::Frozen;
++            bd.support_static[cu] = false;
+             bd.chunk_pose[cu] = s.pose;
+             let (h, aabb) = self.phys.add_static_collider(bd.shapes[cu].clone(), s.pose, chunk_tag(b, c));
+             bd.collider[cu] = Some(h);

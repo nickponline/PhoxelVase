@@ -1,0 +1,311 @@
+--- a/rubble/crates/rubble-core/src/config.rs	2026-10-09 00:41:14
++++ b/rubble/crates/rubble-core/src/config.rs	2026-10-09 01:17:41
+@@ -191,6 +191,10 @@
+     /// of the crushed chunks, every n-th stays as debris (the rest is pulverized); 0 = none.
+     /// Solid debris under the front would cushion and hold up the falling section.
+     pub crush_debris_every: usize,
++    /// `Event::Impact` for new contacts with at least this impulse (N·s); 0 = no impact events
++    pub impact_event_min: f32,
++    /// at most this many `Event::Impact` per tick (the hardest)
++    pub impact_events_max: usize,
+     /// contact impulse (N·s) below which impacts do not damage static chunks
+     pub impact_min_impulse: f32,
+     /// hp damage per N·s above `impact_min_impulse`
+@@ -286,6 +290,8 @@
+             impact_support_band: 1.0,
+             impact_rounds: 3,
+             impact_latency_ticks: 6,
++            impact_event_min: 1000.0,
++            impact_events_max: 64,
+             crush_band: 3.6,
+             crush_min_extent: 8.0,
+             crush_distance: 0.5,
+--- a/rubble/crates/rubble-core/src/events.rs	2026-10-08 18:53:20
++++ b/rubble/crates/rubble-core/src/events.rs	2026-10-09 01:19:32
+@@ -40,4 +40,20 @@
+     ClusterSplit { parent: ClusterId, children: Vec<ClusterId> },
+     ClusterFrozen { cluster: ClusterId, transform: [f32; 16] },
+     ClusterDespawned { cluster: ClusterId },
++    /// A moving piece hit something (another piece, the building, the ground) hard enough
++    /// (`WorldConfig::impact_event_min`). Once per new contact: a piece resting on something
++    /// does not repeat it. For sounds, camera shake, dust.
++    Impact {
++        building: BuildingId,
++        /// impulse-weighted contact point
++        pos: [f32; 3],
++        /// contact normal (unit), pointing from what was hit towards the moving piece
++        normal: [f32; 3],
++        /// total contact impulse (N·s)
++        impulse: f32,
++        /// impulse / mass of the lighter moving side (m/s): how hard it hit, independent of size
++        speed: f32,
++        /// material of the moving piece's chunk at the contact
++        material: u16,
++    },
+ }
+--- a/rubble/crates/rubble-core/src/world.rs	2026-10-09 01:16:11
++++ b/rubble/crates/rubble-core/src/world.rs	2026-10-09 01:51:20
+@@ -309,6 +309,8 @@
+     ground_check_catches: usize,
+     // scratch
+     contacts: Vec<ContactImpulse>,
++    /// collider pairs (sorted tags) in contact last tick, for `Event::Impact`
++    touching: Vec<(u128, u128)>,
+     scratch_u32: Vec<u32>,
+     scratch_hits: Vec<(ClusterKey, u32, Vec3)>,
+ }
+@@ -368,6 +370,7 @@
+             contacts: vec![],
+             scratch_u32: vec![],
+             scratch_hits: vec![],
++            touching: vec![],
+         }
+     }
+ 
+@@ -1852,6 +1855,7 @@
+         self.contacts.clear();
+         let mut contacts = std::mem::take(&mut self.contacts);
+         self.phys.contacts(1.0, &mut contacts);
++        self.impact_events(&contacts);
+         // (cluster, chunk, impulse vector on the cluster)
+         let mut hits = std::mem::take(&mut self.scratch_hits);
+         hits.clear();
+@@ -2154,6 +2158,84 @@
+             );
+         }
+         true
++    }
++
++    /// `Event::Impact` for collider pairs that touch this tick but did not last tick, with a total
++    /// impulse of at least `impact_event_min` (hardest `impact_events_max` of them).
++    fn impact_events(&mut self, contacts: &[ContactImpulse]) {
++        let min = self.cfg.impact_event_min;
++        if min <= 0.0 {
++            self.touching.clear();
++            return;
++        }
++        // per pair (sorted tags): impulse, impulse-weighted point, a normal, the moving side's (tag, sub)
++        struct Pair {
++            key: (u128, u128),
++            j: f32,
++            p: Vec3,
++            n: Vec3,
++            mover: (u128, Option<u32>, Vec3),
++        }
++        let mut pairs: Vec<Pair> = Vec::with_capacity(contacts.len());
++        for ct in contacts {
++            let key = (ct.tag1.min(ct.tag2), ct.tag1.max(ct.tag2));
++            // `normal` points out of collider 1; report it pointing at the moving side
++            let (mover, n) = if tag_kind(ct.tag1) == KIND_CLUSTER {
++                ((ct.tag1, ct.sub1, ct.point), -ct.normal)
++            } else {
++                ((ct.tag2, ct.sub2, ct.point), ct.normal)
++            };
++            pairs.push(Pair { key, j: ct.impulse, p: ct.point * ct.impulse, n, mover });
++        }
++        pairs.sort_by_key(|p| p.key);
++        let mut merged: Vec<Pair> = Vec::with_capacity(pairs.len());
++        for q in pairs {
++            match merged.last_mut() {
++                Some(m) if m.key == q.key => {
++                    m.j += q.j;
++                    m.p += q.p;
++                }
++                _ => merged.push(q),
++            }
++        }
++        let prev = std::mem::take(&mut self.touching);
++        let mut out: Vec<(f32, Event)> = vec![];
++        for m in &merged {
++            if m.j < min || prev.binary_search(&m.key).is_ok() {
++                continue;
++            }
++            let (tag, sub, at) = m.mover;
++            if tag_kind(tag) != KIND_CLUSTER {
++                continue; // static against static: nothing moved
++            }
++            let Some(cl) = self.clusters.get(tag_cluster(tag)) else { continue };
++            let chunk = match sub {
++                Some(s) if (s as usize) < cl.chunks.len() => Some(cl.chunks[s as usize]),
++                _ => self.resolve_hit(tag, at).map(|(_, c)| c),
++            };
++            let Some(chunk) = chunk else { continue };
++            let other = if m.key.0 == tag { m.key.1 } else { m.key.0 };
++            let other_mass = (tag_kind(other) == KIND_CLUSTER)
++                .then(|| self.clusters.get(tag_cluster(other)).map(|c| c.mass))
++                .flatten()
++                .unwrap_or(f32::INFINITY);
++            let mass = cl.mass.min(other_mass).max(1e-3);
++            let bd = &self.buildings[cl.building as usize];
++            out.push((
++                m.j,
++                Event::Impact {
++                    building: BuildingId(cl.building),
++                    pos: a3(m.p / m.j),
++                    normal: a3(m.n.normalize_or_zero()),
++                    impulse: m.j,
++                    speed: m.j / mass,
++                    material: bd.bld.chunks[chunk as usize].material,
++                },
++            ));
++        }
++        self.touching = merged.into_iter().map(|m| m.key).collect();
++        out.sort_by(|a, b| b.0.total_cmp(&a.0));
++        self.events.extend(out.into_iter().take(self.cfg.impact_events_max).map(|(_, e)| e));
+     }
+ 
+     /// Impact stress (input side): a hard landing decelerates the whole cluster by `dv` within
+--- a/rubble/crates/rubble-core/tests/impact_events.rs	1969-12-31 16:00:00
++++ b/rubble/crates/rubble-core/tests/impact_events.rs	2026-10-09 01:51:30
+@@ -0,0 +1,59 @@
++//! `Event::Impact`: an event when a falling piece hits (and one per bounce, each a new contact),
++//! none once it rests.
++use rubble_core::testutil::*;
++use rubble_core::*;
++
++const DT: f32 = 1.0 / 60.0;
++
++/// A 0.8 m concrete block bonded to the side of a pillar of 0.8 m cells, its bottom at `drop_z`
++/// (a multiple of 0.8 m); destroying the pillar cell beside it drops it onto the ground.
++fn drop_block(cfg: WorldConfig, drop_z: f32, secs: f32) -> (Vec<(f32, Event)>, World, u32) {
++    let mut s = SynthBuilder::new("drop_block");
++    let n = ((drop_z + 0.8) / 0.8).round() as usize;
++    let first = s.boxes.len() as u32;
++    s.add_grid([10.0, 0.0, 0.0], [10.8, 0.8, n as f32 * 0.8], [1, 1, n], 0, 0);
++    let holder = first + n as u32 - 1;
++    let block = s.add([9.2, 0.0, drop_z], [10.0, 0.8, drop_z + 0.8], 0, 0);
++    let mut w = World::new(cfg);
++    let b = w.load_building_bld(s.build(), Isometry::identity());
++    w.add_ground_plane(0.0);
++    w.step(DT);
++    w.drain_events();
++    w.damage_chunk(b, holder, 1e9);
++    let mut events = vec![];
++    for i in 0..(secs / DT) as usize {
++        w.step(DT);
++        let t = i as f32 * DT;
++        events.extend(w.drain_events().into_iter().filter(|e| matches!(e, Event::Impact { .. })).map(|e| (t, e)));
++    }
++    (events, w, block)
++}
++
++#[test]
++fn landing_then_bounces_then_silence() {
++    // 4.8 m fall: ~9.7 m/s, then it tumbles and comes to rest
++    let (events, w, block) = drop_block(WorldConfig::default(), 4.8, 5.0);
++    assert!(!events.is_empty(), "the landing must be reported");
++    let (t0, first) = &events[0];
++    let Event::Impact { pos, normal, impulse, speed, material, .. } = first else { unreachable!() };
++    assert!((pos[0] - 9.6).abs() < 1.0 && pos[2].abs() < 0.2, "landing contact on the ground under the block: {pos:?}");
++    assert!(normal[2] > 0.9, "normal from the ground up to the block: {normal:?}");
++    assert!((*speed - 9.7).abs() < 3.0, "speed ~9.7 m/s, got {speed:.2}");
++    assert_eq!(*material, 0, "concrete");
++    // each bounce / tumble is a new, weaker contact
++    for (_, e) in &events[1..] {
++        let Event::Impact { impulse: j, .. } = e else { unreachable!() };
++        assert!(j < impulse, "bounces are weaker than the landing: {j} vs {impulse}");
++    }
++    // resting: silence for the last 2 s
++    let last = events.last().unwrap().0;
++    assert!(last < 3.0, "no impacts while it rests (last at {last:.2} s, landing at {t0:.2} s)");
++    assert!(w.chunk_world_com(0, block as usize).z < 0.5, "it came to rest on the ground");
++}
++
++#[test]
++fn no_events_when_disabled() {
++    let cfg = WorldConfig { impact_event_min: 0.0, ..Default::default() };
++    let (events, _, _) = drop_block(cfg, 4.8, 2.0);
++    assert!(events.is_empty(), "{events:?}");
++}
+--- a/rubble/crates/rubble-viewer/src/effects.rs	2026-10-08 22:57:43
++++ b/rubble/crates/rubble-viewer/src/effects.rs	2026-10-09 01:20:09
+@@ -379,7 +379,6 @@
+ ) {
+     let dt = time.delta_secs();
+     let events = std::mem::take(&mut sim.fx_events);
+-    sim.collect_impacts = ov.particles;
+     let ticks = sim.world.tick.saturating_sub(st.tick).min(30) as u32;
+     st.tick = sim.world.tick;
+     let ground = sim.ground.unwrap_or(-1e9);
+--- a/rubble/crates/rubble-viewer/src/main.rs	2026-10-08 23:12:38
++++ b/rubble/crates/rubble-viewer/src/main.rs	2026-10-09 01:20:09
+@@ -63,10 +63,6 @@
+     pub hurry: Vec<(u32, f32)>,
+     /// breaks / hard landings since the effects system last ran
+     pub fx_events: Vec<effects::FxEvent>,
+-    /// look for hard contacts each tick (particles on)
+-    pub collect_impacts: bool,
+-    /// collider pairs in contact last tick (only new contacts throw up debris)
+-    touching: std::collections::HashSet<(u128, u128)>,
+ }
+ 
+ fn run_action(w: &mut EngineWorld, a: &Scheduled) {
+@@ -98,8 +94,6 @@
+             queued: vec![],
+             hurry: vec![],
+             fx_events: vec![],
+-            collect_impacts: false,
+-            touching: Default::default(),
+         }
+         .with_centres()
+     }
+@@ -117,28 +111,6 @@
+         self
+     }
+ 
+-    /// Hard new contacts this tick -> `FxEvent::Impact` (resting contacts never repeat).
+-    fn find_impacts(&mut self) {
+-        let mut contacts = vec![];
+-        self.world.phys.contacts(50.0, &mut contacts);
+-        let mut touching = std::collections::HashSet::with_capacity(contacts.len());
+-        let mut picked: Vec<[f32; 3]> = vec![];
+-        for c in &contacts {
+-            let key = (c.tag1.min(c.tag2), c.tag1.max(c.tag2));
+-            touching.insert(key);
+-            if c.impulse < effects::IMPACT_MIN || self.touching.contains(&key) || picked.len() >= effects::IMPACTS_PER_TICK {
+-                continue;
+-            }
+-            let p = c.point.to_array();
+-            let near = |q: &[f32; 3]| (q[0] - p[0]).powi(2) + (q[1] - p[1]).powi(2) + (q[2] - p[2]).powi(2) < effects::IMPACT_SPACING.powi(2);
+-            if !picked.iter().any(near) && self.fx_events.len() < effects::MAX_FX_EVENTS {
+-                picked.push(p);
+-                self.fx_events.push(effects::FxEvent::Impact { pos: p, impulse: c.impulse });
+-            }
+-        }
+-        self.touching = touching;
+-    }
+-
+     fn step(&mut self, spec: &WorldSpec, now: f64) {
+         let now_t = self.world.time + 1e-6;
+         while let Some((t, a)) = spec.actions.get(self.next_action) {
+@@ -162,9 +134,18 @@
+         }
+         let events = self.world.drain_events();
+         let n = events.len();
++        // hard landings already reported this tick (the engine sends the hardest first)
++        let mut landed: Vec<[f32; 3]> = vec![];
+         for e in events {
+             use effects::FxEvent;
+             let fx = match e {
++                rubble_core::Event::Impact { pos, impulse, .. } => {
++                    let near = |q: &[f32; 3]| (q[0] - pos[0]).powi(2) + (q[1] - pos[1]).powi(2) + (q[2] - pos[2]).powi(2) < effects::IMPACT_SPACING.powi(2);
++                    (impulse >= effects::IMPACT_MIN && landed.len() < effects::IMPACTS_PER_TICK && !landed.iter().any(near)).then(|| {
++                        landed.push(pos);
++                        FxEvent::Impact { pos, impulse }
++                    })
++                }
+                 rubble_core::Event::ChunkShattered { building, chunk, pos, material } => {
+                     if self.world.buildings[building.0 as usize].glass(chunk as usize) {
+                         self.shattered.push((building.0, chunk));
+@@ -184,11 +165,6 @@
+                     self.fx_events.push(fx);
+                 }
+             }
+-        }
+-        if self.collect_impacts {
+-            self.find_impacts();
+-        } else {
+-            self.touching.clear();
+         }
+         self.event_log.push_back((now, n));
+         while self.event_log.front().is_some_and(|(t, _)| now - t > 1.0) {

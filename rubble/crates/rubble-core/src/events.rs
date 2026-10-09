@@ -40,4 +40,20 @@ pub enum Event {
     ClusterSplit { parent: ClusterId, children: Vec<ClusterId> },
     ClusterFrozen { cluster: ClusterId, transform: [f32; 16] },
     ClusterDespawned { cluster: ClusterId },
+    /// A moving piece hit something (another piece, the building, the ground) hard enough
+    /// (`WorldConfig::impact_event_min`). Once per new contact: a piece resting on something
+    /// does not repeat it. For sounds, camera shake, dust.
+    Impact {
+        building: BuildingId,
+        /// impulse-weighted contact point
+        pos: [f32; 3],
+        /// contact normal (unit), pointing from what was hit towards the moving piece
+        normal: [f32; 3],
+        /// total contact impulse (N·s)
+        impulse: f32,
+        /// impulse / mass of the lighter moving side (m/s): how hard it hit, independent of size
+        speed: f32,
+        /// material of the moving piece's chunk at the contact
+        material: u16,
+    },
 }

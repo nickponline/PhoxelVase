@@ -109,6 +109,11 @@ pub struct WorldConfig {
     pub keep_debris_max_clusters: usize,
     /// clusters still moving after this long are force-frozen (big) or despawned (small)
     pub max_dynamic_time: f32,
+    /// Focus (see `World::set_focus`, e.g. the player's camera): small debris farther than
+    /// `lod_far` (m) from every focus point lives only `lod_far_ttl` of its usual time, and when
+    /// the piece budgets are exceeded small debris goes farthest first. No focus: no effect.
+    pub lod_far: f32,
+    pub lod_far_ttl: f32,
     pub rest_lin_vel: f32,
     pub rest_ang_vel: f32,
     /// Rigid-body tipping check (`Building::tipping_edges`) on horizontal planes at the heights
@@ -191,6 +196,10 @@ pub struct WorldConfig {
     /// of the crushed chunks, every n-th stays as debris (the rest is pulverized); 0 = none.
     /// Solid debris under the front would cushion and hold up the falling section.
     pub crush_debris_every: usize,
+    /// `Event::Impact` for new contacts with at least this impulse (N·s); 0 = no impact events
+    pub impact_event_min: f32,
+    /// at most this many `Event::Impact` per tick (the hardest)
+    pub impact_events_max: usize,
     /// contact impulse (N·s) below which impacts do not damage static chunks
     pub impact_min_impulse: f32,
     /// hp damage per N·s above `impact_min_impulse`
@@ -256,6 +265,8 @@ impl Default for WorldConfig {
             keep_debris_max_age: 120.0,
             keep_debris_max_clusters: 2048,
             max_dynamic_time: 30.0,
+            lod_far: 60.0,
+            lod_far_ttl: 0.25,
             rest_lin_vel: 0.15,
             rest_ang_vel: 0.25,
             ground_check: true,
@@ -286,6 +297,8 @@ impl Default for WorldConfig {
             impact_support_band: 1.0,
             impact_rounds: 3,
             impact_latency_ticks: 6,
+            impact_event_min: 1000.0,
+            impact_events_max: 64,
             crush_band: 3.6,
             crush_min_extent: 8.0,
             crush_distance: 0.5,

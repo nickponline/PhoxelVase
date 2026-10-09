@@ -1,0 +1,55 @@
+--- a/rubble/crates/rubble-core/src/world.rs	2026-10-09 01:04:33
++++ b/rubble/crates/rubble-core/src/world.rs	2026-10-09 01:16:11
+@@ -2501,6 +2501,23 @@
+         let com_margin = com_margin.filter(|_| chunks.len() > 1);
+         let mut patches: Vec<[f64; 2]> = vec![];
+         let bd = &self.buildings[b as usize];
++        // horizontal centre of mass (only needed with a margin)
++        let com = com_margin.and_then(|_| {
++            let (mut m, mut cx, mut cy) = (0f64, 0f64, 0f64);
++            for &c in chunks {
++                let ch = &bd.bld.chunks[c as usize];
++                let w = pose_of(c).transform_point(v3(ch.com));
++                m += ch.mass as f64;
++                cx += ch.mass as f64 * w.x as f64;
++                cy += ch.mass as f64 * w.y as f64;
++            }
++            (m > 0.0).then(|| [cx / m, cy / m])
++        });
++        // The footprint of the resting chunks only grows, so once part of it holds the centre
++        // of mass the whole of it does: test it as it grows (at 4, 8, 16, ... resting chunks)
++        // and stop probing the rest. Same answer as testing once at the end, without probing
++        // every chunk of a big flat group.
++        let mut next_check = 4usize;
+         // lowest chunks first: they are the ones that rest on something; stop at the first solid hit
+         let mut order: Vec<(f32, u32)> =
+             chunks.iter().map(|&c| (pose_of(c).transform_point(v3(bd.bld.chunks[c as usize].aabb_min)).z, c)).collect();
+@@ -2560,18 +2577,18 @@
+                     [hi.x as f64, hi.y as f64],
+                     [lo.x as f64, hi.y as f64],
+                 ]);
++                if let (Some(margin), Some(com)) = (com_margin, com) {
++                    if patches.len() / 4 >= next_check {
++                        next_check *= 2;
++                        if crate::building::dist_outside_hull(&mut patches, com) <= margin as f64 {
++                            return Support::Solid;
++                        }
++                    }
++                }
+             }
+         }
+-        if let (Some(margin), false) = (com_margin, patches.is_empty()) {
+-            let (mut m, mut cx, mut cy) = (0f64, 0f64, 0f64);
+-            for &c in chunks {
+-                let ch = &bd.bld.chunks[c as usize];
+-                let w = pose_of(c).transform_point(v3(ch.com));
+-                m += ch.mass as f64;
+-                cx += ch.mass as f64 * w.x as f64;
+-                cy += ch.mass as f64 * w.y as f64;
+-            }
+-            if m > 0.0 && crate::building::dist_outside_hull(&mut patches, [cx / m, cy / m]) <= margin as f64 {
++        if let (Some(margin), Some(com), false) = (com_margin, com, patches.is_empty()) {
++            if crate::building::dist_outside_hull(&mut patches, com) <= margin as f64 {
+                 return Support::Solid;
+             }
+         }

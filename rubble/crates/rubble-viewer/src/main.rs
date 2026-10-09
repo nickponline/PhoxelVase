@@ -63,10 +63,6 @@ pub struct Sim {
     pub hurry: Vec<(u32, f32)>,
     /// breaks / hard landings since the effects system last ran
     pub fx_events: Vec<effects::FxEvent>,
-    /// look for hard contacts each tick (particles on)
-    pub collect_impacts: bool,
-    /// collider pairs in contact last tick (only new contacts throw up debris)
-    touching: std::collections::HashSet<(u128, u128)>,
 }
 
 fn run_action(w: &mut EngineWorld, a: &Scheduled) {
@@ -98,8 +94,6 @@ impl Sim {
             queued: vec![],
             hurry: vec![],
             fx_events: vec![],
-            collect_impacts: false,
-            touching: Default::default(),
         }
         .with_centres()
     }
@@ -115,28 +109,6 @@ impl Sim {
             })
             .collect();
         self
-    }
-
-    /// Hard new contacts this tick -> `FxEvent::Impact` (resting contacts never repeat).
-    fn find_impacts(&mut self) {
-        let mut contacts = vec![];
-        self.world.phys.contacts(50.0, &mut contacts);
-        let mut touching = std::collections::HashSet::with_capacity(contacts.len());
-        let mut picked: Vec<[f32; 3]> = vec![];
-        for c in &contacts {
-            let key = (c.tag1.min(c.tag2), c.tag1.max(c.tag2));
-            touching.insert(key);
-            if c.impulse < effects::IMPACT_MIN || self.touching.contains(&key) || picked.len() >= effects::IMPACTS_PER_TICK {
-                continue;
-            }
-            let p = c.point.to_array();
-            let near = |q: &[f32; 3]| (q[0] - p[0]).powi(2) + (q[1] - p[1]).powi(2) + (q[2] - p[2]).powi(2) < effects::IMPACT_SPACING.powi(2);
-            if !picked.iter().any(near) && self.fx_events.len() < effects::MAX_FX_EVENTS {
-                picked.push(p);
-                self.fx_events.push(effects::FxEvent::Impact { pos: p, impulse: c.impulse });
-            }
-        }
-        self.touching = touching;
     }
 
     fn step(&mut self, spec: &WorldSpec, now: f64) {
@@ -162,9 +134,18 @@ impl Sim {
         }
         let events = self.world.drain_events();
         let n = events.len();
+        // hard landings already reported this tick (the engine sends the hardest first)
+        let mut landed: Vec<[f32; 3]> = vec![];
         for e in events {
             use effects::FxEvent;
             let fx = match e {
+                rubble_core::Event::Impact { pos, impulse, .. } => {
+                    let near = |q: &[f32; 3]| (q[0] - pos[0]).powi(2) + (q[1] - pos[1]).powi(2) + (q[2] - pos[2]).powi(2) < effects::IMPACT_SPACING.powi(2);
+                    (impulse >= effects::IMPACT_MIN && landed.len() < effects::IMPACTS_PER_TICK && !landed.iter().any(near)).then(|| {
+                        landed.push(pos);
+                        FxEvent::Impact { pos, impulse }
+                    })
+                }
                 rubble_core::Event::ChunkShattered { building, chunk, pos, material } => {
                     if self.world.buildings[building.0 as usize].glass(chunk as usize) {
                         self.shattered.push((building.0, chunk));
@@ -184,11 +165,6 @@ impl Sim {
                     self.fx_events.push(fx);
                 }
             }
-        }
-        if self.collect_impacts {
-            self.find_impacts();
-        } else {
-            self.touching.clear();
         }
         self.event_log.push_back((now, n));
         while self.event_log.front().is_some_and(|(t, _)| now - t > 1.0) {
@@ -638,6 +614,10 @@ fn controls(
     // every frame, so a fresh world (reset, next building) picks it up too; affects debris
     // created from now on
     sim.world.cfg.keep_debris = ov.keep_debris;
+    // the camera is where the destruction is watched from: debris near it is kept longest
+    if let Ok((_, gt)) = cams.single() {
+        sim.world.set_focus(&[to_engine(gt.translation())]);
+    }
     if keys.just_pressed(KeyCode::KeyH) {
         ov.help = !ov.help;
     }
