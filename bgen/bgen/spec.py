@@ -165,7 +165,7 @@ def _node_list(nodes) -> list[tuple[str, dict]]:
 def resolve_spec(spec: dict, seed: int | None = None) -> dict:
     """Merge the preset and sample global/blockout ranges. Returns a fully resolved spec with
     keys: name, preset, seed, global (scalars), blockout (list of masses), nodes
-    (list of {name: params}), fracture, indestructible."""
+    (list of {name: params}), fracture, indestructible, foundation, basement."""
     spec = copy.deepcopy(spec)
     seed = int(spec.get("seed", 0) if seed is None else seed)
     preset_name = spec.get("preset", "office")
@@ -204,7 +204,9 @@ def resolve_spec(spec: dict, seed: int | None = None) -> dict:
     out = dict(name=str(spec.get("name", preset_name)), preset=preset_name, seed=seed,
                generator=GENERATOR_VERSION, global_=glob, blockout=masses, nodes=nodes,
                fracture=frac, indestructible=list(spec.get("indestructible", ["ground_slab"]) or []),
-               stability=dict(spec.get("stability", {}) or {}))
+               stability=dict(spec.get("stability", {}) or {}),
+               foundation=spec.get("foundation", {}),
+               basement=spec.get("basement", {}))
     out["global"] = out.pop("global_")
     if "_dir" in spec:
         out["_dir"] = spec["_dir"]

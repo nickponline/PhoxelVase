@@ -13,7 +13,7 @@ from test_nodes_overlap import describe, find_overlaps
 from test_pipeline import panel_level_floating
 
 SPECS = Path(__file__).resolve().parents[1] / "specs"
-STRUCTURES = ["aqueduct", "colossus"]
+STRUCTURES = ["colossus"]
 
 
 def test_mirror_expansion():

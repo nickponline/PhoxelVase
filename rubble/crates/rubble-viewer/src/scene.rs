@@ -106,13 +106,14 @@ struct Scenario {
     buildings: Vec<BuildingSpec>,
     #[serde(default)]
     actions: Vec<Action>,
+    /// ground plane height, `null` for none, or `auto` (default): the lowest foundation bottom
     #[serde(default = "default_ground")]
-    ground: Option<f32>,
+    ground: serde_yaml::Value,
     #[serde(default)]
     config: Option<serde_yaml::Value>,
 }
-fn default_ground() -> Option<f32> {
-    Some(0.0)
+fn default_ground() -> serde_yaml::Value {
+    serde_yaml::Value::String("auto".into())
 }
 
 #[derive(Deserialize)]
@@ -224,12 +225,17 @@ fn merge_yaml(base: &mut serde_yaml::Value, over: &serde_yaml::Value) {
     }
 }
 
+/// Half-size (m) of the ground laid around buildings with sunk foundations.
+pub const TERRAIN_EXTENT: f32 = 1000.0;
+
 /// Everything needed to (re)build the world from scratch (R = reset).
 #[derive(Resource, Clone)]
 pub struct WorldSpec {
     pub cfg: WorldConfig,
     pub buildings: Vec<(Bld, Isometry)>,
     pub ground: Option<f32>,
+    /// `ground` follows the buildings' foundations (see `fit_ground`)
+    pub ground_auto: bool,
     /// scripted actions, sorted by time
     pub actions: Vec<(f32, Scheduled)>,
     pub title: String,
@@ -253,12 +259,14 @@ impl WorldSpec {
             let mut spec = Self::from_scenario(sc)?;
             // extra .bld files on the command line are appended to the right of the scenario
             spec.append_row(&a.blds)?;
+            spec.fit_ground();
             return Ok(spec);
         }
         let mut spec = WorldSpec {
             cfg: WorldConfig::default(),
             buildings: vec![],
             ground: Some(0.0),
+            ground_auto: true,
             actions: vec![],
             title: String::new(),
         };
@@ -284,7 +292,16 @@ impl WorldSpec {
             }
             spec.title = "synthetic testutil arena".into();
         }
+        spec.fit_ground();
         Ok(spec)
+    }
+
+    /// With `ground_auto`, put the ground plane at the lowest foundation bottom (0 without any).
+    fn fit_ground(&mut self) {
+        if self.ground_auto {
+            let z = self.buildings.iter().map(|(b, iso)| iso.pos[2] + b.ground_z()).reduce(f32::min);
+            self.ground = Some(z.unwrap_or(0.0));
+        }
     }
 
     /// Lay `.bld` files out in a row along +X after whatever is already loaded.
@@ -357,7 +374,14 @@ impl WorldSpec {
             }
         }
         actions.sort_by(|a, b| a.0.total_cmp(&b.0));
-        Ok(WorldSpec { cfg, buildings, ground: sc.ground, actions, title: path.display().to_string() })
+        let (ground, ground_auto) = match &sc.ground {
+            serde_yaml::Value::Null => (None, false),
+            serde_yaml::Value::String(s) if s == "auto" => (None, true),
+            v => (Some(v.as_f64().ok_or_else(|| format!("{}: ground must be a number, null or auto", path.display()))? as f32), false),
+        };
+        let mut spec = WorldSpec { cfg, buildings, ground, ground_auto, actions, title: path.display().to_string() };
+        spec.fit_ground();
+        Ok(spec)
     }
 
     pub fn build_world(&self) -> World {
@@ -366,6 +390,10 @@ impl WorldSpec {
             w.load_building_bld(bld.clone(), *iso);
         }
         if let Some(z) = self.ground {
+            // ground level around sunk foundations / basements (the plane catches the pits)
+            if self.ground_auto {
+                w.add_terrain(TERRAIN_EXTENT);
+            }
             w.add_ground_plane(z);
         }
         w
@@ -470,10 +498,18 @@ pub fn building_name(p: &Path) -> String {
 }
 
 impl WorldSpec {
-    /// A world holding just one `.bld` at the origin (default config, ground at z = 0).
+    /// A world holding just one `.bld` at the origin (default config, ground under its foundation).
     pub fn single(path: &Path) -> Result<Self, String> {
-        let mut spec = WorldSpec { cfg: WorldConfig::default(), buildings: vec![], ground: Some(0.0), actions: vec![], title: building_name(path) };
+        let mut spec = WorldSpec {
+            cfg: WorldConfig::default(),
+            buildings: vec![],
+            ground: Some(0.0),
+            ground_auto: true,
+            actions: vec![],
+            title: building_name(path),
+        };
         spec.append_row(&[path.to_path_buf()])?;
+        spec.fit_ground();
         Ok(spec)
     }
 }

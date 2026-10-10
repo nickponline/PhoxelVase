@@ -158,6 +158,18 @@ impl World {
         self.w.add_ground_plane(z);
     }
 
+    /// Ground level around the loaded buildings' sunk foundations (see `World::add_terrain`);
+    /// False when none has one.
+    #[pyo3(signature = (extent=1000.0))]
+    fn add_terrain(&mut self, extent: f32) -> bool {
+        self.w.add_terrain(extent)
+    }
+
+    /// Bottom of the lowest foundation (0 without any): where the ground plane goes.
+    fn foundation_ground_z(&self) -> f32 {
+        self.w.foundation_ground_z()
+    }
+
     /// Fire a projectile. `weapon`: 'ar' | 'smg' | 'sniper' | 'shotgun' | 'launcher' or
     /// {'custom': {...WeaponParams}}. Hitscan unless `ballistic=True`.
     #[pyo3(signature = (origin, dir, weapon=None, ballistic=false))]

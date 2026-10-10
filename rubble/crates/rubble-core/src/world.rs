@@ -287,6 +287,10 @@ pub struct World {
     pub phys: RapierBackend,
     pub buildings: Vec<Building>,
     pub clusters: SlotMap<ClusterKey, Cluster>,
+    /// solid ground cells added by `add_terrain`: world xy (min, max), from `terrain_z.0` (bottom)
+    /// up to `terrain_z.1` (top)
+    pub terrain: Vec<([f32; 2], [f32; 2])>,
+    pub terrain_z: (f32, f32),
     projectiles: Vec<Projectile>,
     /// queued beams
     beams: Vec<Beam>,
@@ -354,6 +358,8 @@ impl World {
             phys,
             buildings: vec![],
             clusters: SlotMap::with_key(),
+            terrain: vec![],
+            terrain_z: (0.0, 0.0),
             projectiles: vec![],
             beams: vec![],
             explosions: vec![],
@@ -417,6 +423,80 @@ impl World {
         self.settle_stress_at_load(bi as usize);
         self.needs_sync = true;
         BuildingId(bi)
+    }
+
+    /// Ground height under the loaded buildings: the lowest foundation bottom (0 if none loaded).
+    pub fn foundation_ground_z(&self) -> f32 {
+        self.buildings.iter().map(|b| b.pose.translation.z + b.bld.ground_z()).reduce(f32::min).unwrap_or(0.0)
+    }
+
+    /// Solid ground over a square of half-size `extent` around the buildings, from the bottom of
+    /// their foundations up to ground level, with a pit where each foundation (and basement)
+    /// sits: what breaks through the ground floor falls below ground level, and debris thrown
+    /// clear lands on the ground surface. Pits are the world-axis bounds of each (yawed)
+    /// foundation rectangle. Static box colliders,
+    /// tagged as ground; the cells are kept in `terrain` for drawing. Returns false (adding
+    /// nothing) when no building has a foundation. Pair it with a ground plane at
+    /// `foundation_ground_z` under the pits.
+    pub fn add_terrain(&mut self, extent: f32) -> bool {
+        let (mut pits, mut top, mut bottom) = (vec![], f32::MAX, f32::MAX);
+        for b in &self.buildings {
+            let Some(f) = b.bld.foundation() else { continue };
+            for r in &f.rects {
+                let (mut lo, mut hi) = ([f32::MAX; 2], [f32::MIN; 2]);
+                for (x, y) in [(r[0], r[1]), (r[2], r[1]), (r[2], r[3]), (r[0], r[3])] {
+                    let p = b.pose.transform_point(Vec3::new(x, y, 0.0));
+                    lo = [lo[0].min(p.x), lo[1].min(p.y)];
+                    hi = [hi[0].max(p.x), hi[1].max(p.y)];
+                }
+                pits.push((lo, hi));
+            }
+            top = top.min(b.pose.translation.z + f.top);
+            bottom = bottom.min(b.pose.translation.z + f.bottom);
+        }
+        if pits.is_empty() || top <= bottom {
+            return false;
+        }
+        let (lo, hi) = pits.iter().fold(([f32::MAX; 2], [f32::MIN; 2]), |(l, h), (a, b)| {
+            ([l[0].min(a[0]), l[1].min(a[1])], [h[0].max(b[0]), h[1].max(b[1])])
+        });
+        let c = [(lo[0] + hi[0]) * 0.5, (lo[1] + hi[1]) * 0.5];
+        // grid on every pit edge; cells outside all pits are ground, merged into runs along x
+        let axis = |k: usize| {
+            let mut v: Vec<f32> = pits.iter().flat_map(|(a, b)| [a[k], b[k]]).collect();
+            v.extend([c[k] - extent, c[k] + extent]);
+            v.sort_by(f32::total_cmp);
+            v.dedup_by(|a, b| (*a - *b).abs() < 1e-4);
+            v
+        };
+        let (xs, ys) = (axis(0), axis(1));
+        let in_pit = |x: f32, y: f32| pits.iter().any(|(a, b)| x > a[0] && x < b[0] && y > a[1] && y < b[1]);
+        let mut cells = vec![];
+        for j in 0..ys.len() - 1 {
+            let ym = 0.5 * (ys[j] + ys[j + 1]);
+            let mut i = 0;
+            while i < xs.len() - 1 {
+                if in_pit(0.5 * (xs[i] + xs[i + 1]), ym) {
+                    i += 1;
+                    continue;
+                }
+                let s = i;
+                while i < xs.len() - 1 && !in_pit(0.5 * (xs[i] + xs[i + 1]), ym) {
+                    i += 1;
+                }
+                cells.push(([xs[s], ys[j]], [xs[i], ys[j + 1]]));
+            }
+        }
+        let hz = 0.5 * (top - bottom);
+        for &(a, b) in &cells {
+            let shape = Shape::cuboid(0.5 * (b[0] - a[0]), 0.5 * (b[1] - a[1]), hz);
+            let pose = Pose::from_translation(Vec3::new(0.5 * (a[0] + b[0]), 0.5 * (a[1] + b[1]), bottom + hz));
+            self.phys.add_static_collider(shape, pose, KIND_GROUND << 64);
+        }
+        self.terrain.extend(cells);
+        self.terrain_z = (bottom, top);
+        self.needs_sync = true;
+        true
     }
 
     pub fn add_ground_plane(&mut self, z: f32) {

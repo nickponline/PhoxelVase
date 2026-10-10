@@ -21,9 +21,10 @@ struct Scenario {
     actions: Vec<Action>,
     #[serde(default)]
     record: Record,
-    /// ground plane height; `null` disables the ground
+    /// ground plane height; `null` disables the ground, `auto` (default) puts it at the lowest
+    /// foundation bottom of the loaded buildings and lays ground level around their foundations
     #[serde(default = "default_ground")]
-    ground: Option<f32>,
+    ground: serde_yaml::Value,
     /// optional WorldConfig overrides (any subset of fields)
     #[serde(default)]
     config: Option<serde_yaml::Value>,
@@ -31,8 +32,11 @@ struct Scenario {
 fn default_dt() -> f32 {
     1.0 / 60.0
 }
-fn default_ground() -> Option<f32> {
-    Some(0.0)
+/// half-size (m) of the ground laid around buildings with sunk foundations
+const TERRAIN_EXTENT: f32 = 1000.0;
+
+fn default_ground() -> serde_yaml::Value {
+    serde_yaml::Value::String("auto".into())
 }
 
 #[derive(Deserialize)]
@@ -248,8 +252,13 @@ fn run_scenario(path: &Path, out_override: Option<PathBuf>) -> Result<(), Box<dy
         }
     }
     let load_ms = t_load.elapsed().as_secs_f64() * 1e3;
-    if let Some(z) = sc.ground {
-        w.add_ground_plane(z);
+    match &sc.ground {
+        serde_yaml::Value::Null => {}
+        serde_yaml::Value::String(s) if s == "auto" => {
+            w.add_terrain(TERRAIN_EXTENT);
+            w.add_ground_plane(w.foundation_ground_z());
+        }
+        v => w.add_ground_plane(v.as_f64().ok_or("ground must be a number, null or auto")? as f32),
     }
     let out = out_override.unwrap_or_else(|| {
         let o = PathBuf::from(&sc.record.out);
@@ -296,6 +305,8 @@ fn run_scenario(path: &Path, out_override: Option<PathBuf>) -> Result<(), Box<dy
     let mut worst = StepTimings::default();
     let mut worst_tick = 0u64;
     let mut tick_ms_nowait = Vec::with_capacity(sc.steps);
+    // per-phase totals over the run (ms)
+    let mut phase = StepTimings::default();
     let mut n_events = 0usize;
     let t_run = Instant::now();
     for step in 0..sc.steps {
@@ -316,6 +327,17 @@ fn run_scenario(path: &Path, out_override: Option<PathBuf>) -> Result<(), Box<dy
         w.step(sc.dt);
         tick_ms.push(w.timings.total_ms);
         tick_ms_nowait.push(w.timings.total_ms - w.timings.impact_wait_ms);
+        let t = &w.timings;
+        phase.projectiles_ms += t.projectiles_ms;
+        phase.damage_ms += t.damage_ms;
+        phase.connectivity_ms += t.connectivity_ms;
+        phase.stress_ms += t.stress_ms;
+        phase.promotion_ms += t.promotion_ms;
+        phase.physics_ms += t.physics_ms;
+        phase.impacts_ms += t.impacts_ms;
+        phase.settle_ms += t.settle_ms;
+        phase.impact_wait_ms += t.impact_wait_ms;
+        phase.total_ms += t.total_ms;
         if w.timings.total_ms > worst.total_ms {
             worst = w.timings;
             worst_tick = w.tick;
@@ -361,6 +383,7 @@ fn run_scenario(path: &Path, out_override: Option<PathBuf>) -> Result<(), Box<dy
     println!("excluding blocking waits on background impact solves: p99 {p99_nw:.3} ms, max {max_nw:.3} ms");
     println!("final: {st:?}");
     println!("worst tick {worst_tick}: {worst:?}");
+    println!("phase totals: {phase:?}");
     Ok(())
 }
 

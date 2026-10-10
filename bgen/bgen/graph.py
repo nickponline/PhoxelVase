@@ -199,10 +199,19 @@ def build_graph(panels: list[Panel], chunks: list[ChunkGeom], min_contact: float
     return [best[k] for k in sorted(best)]
 
 
-def mark_anchors(panels: list[Panel], chunks: list[ChunkGeom], ground_z: float = 0.0, eps: float = 1e-3) -> None:
+def mark_anchors(panels: list[Panel], chunks: list[ChunkGeom], ground_z: float = 0.0, eps: float = 1e-3,
+                 pit: dict | None = None) -> None:
     """Set F_ANCHOR on chunks touching the ground (any hull vertex z <= ground_z + eps)
-    or belonging to a panel tagged anchor=True."""
+    or belonging to a panel tagged anchor=True. With `pit` (the foundation meta: `rects` sunk
+    below ground level `top`), chunks resting on ground level outside the pit stand on the
+    earth and are anchored too."""
     anchored = {p.id for p in panels if (p.tags or {}).get("anchor")}
+    rects = np.asarray(pit["rects"], float).reshape(-1, 4) if pit else None
     for c in chunks:
-        if c.panel_id in anchored or float(c.hull_verts[:, 2].min()) <= ground_z + eps:
+        z = float(c.hull_verts[:, 2].min())
+        if c.panel_id in anchored or z <= ground_z + eps:
             c.flags |= F_ANCHOR
+        elif rects is not None and abs(z - pit["top"]) <= eps:
+            x, y = c.hull_verts[:, :2].mean(0)
+            if not ((rects[:, 0] < x) & (x < rects[:, 2]) & (rects[:, 1] < y) & (y < rects[:, 3])).any():
+                c.flags |= F_ANCHOR

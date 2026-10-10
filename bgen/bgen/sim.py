@@ -10,7 +10,8 @@ Scenario YAML (same schema as rubble-sim, see rubble/crates/rubble-sim/README.md
       - {path: fixtures/two_box.bld, pos: [0,0,0], yaw: 0}
     steps: 600
     dt: 0.016666
-    ground: 0.0                      # null = no ground plane
+    ground: auto                     # height, null = no ground plane, auto = ground level around
+                                     # sunk foundations, plane at the lowest foundation bottom
     config: {stress: {bending: true}} # partial WorldConfig override
     actions:
       - {t: 0.5, explode: {center: [2,2,0.5], radius: 3, inner_radius: 0.5, damage: 800, impulse: 4000}}
@@ -151,9 +152,6 @@ def simulate(sc: dict, base: Path | None = None, every: int | None = None) -> di
     import rubble
 
     w = rubble.World(sc.get("config"))
-    ground = sc.get("ground", 0.0)
-    if ground is not None:
-        w.add_ground_plane(float(ground))
     blds, paths = [], []
     for spec in sc["buildings"]:
         if "path" not in spec:
@@ -162,6 +160,12 @@ def simulate(sc: dict, base: Path | None = None, every: int | None = None) -> di
         b = w.load_building(str(p), pos=tuple(spec.get("pos", (0, 0, 0))), yaw=float(spec.get("yaw", 0.0)))
         blds.append(b)
         paths.append(p)
+    ground = sc.get("ground", "auto")
+    if ground == "auto":
+        w.add_terrain()  # ground level around sunk foundations / basements
+        ground = w.foundation_ground_z()
+    if ground is not None:
+        w.add_ground_plane(float(ground))
     counts = [w.n_chunks(b) for b in blds]
     offs = np.concatenate([[0], np.cumsum(counts)]).astype(int)
     steps = int(sc.get("steps", 600))
@@ -286,7 +290,7 @@ def contact_sheet(paths, labels, out_path, cols: int = 3, max_width: int = 480):
 
 def combined_mesh(bds: list, xf0: np.ndarray, offsets: np.ndarray):
     """Merge buildings into one world-space RenderMesh baked at the frame-0 chunk transforms."""
-    from .render.scene import build_mesh
+    from .render.scene import build_mesh, ground_of
 
     parts = [build_mesh(bd) for bd in bds]
     pos, nrm, flags, vch, tris, tch = [], [], [], [], [], []
@@ -308,8 +312,11 @@ def combined_mesh(bds: list, xf0: np.ndarray, offsets: np.ndarray):
         ekind.append(m.elem_kind); efloor.append(m.elem_floor); mass.append(m.mass)
         voff += len(m.pos)
         eoff += int(m.elem.max()) + 1 if m.n_chunks else 0
+    grounds = [ground_of(bd.meta.get("foundation"), xf0[int(offsets[bi])]) for bi, bd in enumerate(bds)]
+    grounds = [g for g in grounds if g is not None]
+    ground = (min(g[0] for g in grounds), np.concatenate([g[1] for g in grounds])) if grounds else None
     cat = np.concatenate
-    return replace(parts[0], pos=cat(pos).astype(np.float32), nrm=cat(nrm).astype(np.float32), flags=cat(flags),
+    return replace(parts[0], ground=ground, pos=cat(pos).astype(np.float32), nrm=cat(nrm).astype(np.float32), flags=cat(flags),
                    vchunk=cat(vch).astype(np.int32), tris=cat(tris).astype(np.uint32),
                    tchunk=cat(tch).astype(np.int32), n_chunks=int(offsets[-1]), com=cat(com), aabb_min=cat(lo),
                    aabb_max=cat(hi), material=cat(mat), chunk_flags=cat(cfl), elem=cat(elem),

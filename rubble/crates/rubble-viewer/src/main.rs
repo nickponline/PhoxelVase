@@ -433,20 +433,7 @@ fn setup(
         .build(),
     ));
 
-    // ground plane (engine z = ground) — Plane3d is authored Y-up, i.e. already Bevy space
-    if let Some(z) = spec.ground {
-        let size = (ext * 20.0).max(2000.0);
-        commands.spawn((
-            Mesh3d(meshes.add(Plane3d::default().mesh().size(size, size))),
-            MeshMaterial3d(mats.add(StandardMaterial {
-                base_color: Color::srgb(0.42, 0.45, 0.40),
-                perceptual_roughness: 1.0,
-                reflectance: 0.1,
-                ..default()
-            })),
-            Transform::from_translation(to_bevy([c[0], c[1], z - 0.002])),
-        ));
-    }
+    spawn_ground(&mut commands, &mut meshes, &mut mats, &sim, c, ext);
     overlay::spawn_text(&mut commands, ui_cam);
 }
 
@@ -466,6 +453,50 @@ fn camera_pose(spec: &WorldSpec, cam: Option<[f32; 3]>, look: Option<[f32; 3]>) 
     CamCtl::looking_at(to_bevy(eye), to_bevy(target))
 }
 
+/// The ground surface mesh, rebuilt by `cycle_buildings`.
+#[derive(Component)]
+struct GroundPlane;
+
+/// The ground: the terrain's top (ground level, with the foundation pits left open) when the
+/// world has terrain, else a big plane at the ground height.
+fn spawn_ground(commands: &mut Commands, meshes: &mut Assets<Mesh>, mats: &mut Assets<StandardMaterial>, sim: &Sim, c: [f32; 3], ext: f32) {
+    let Some(z) = sim.ground else { return };
+    let mat = mats.add(StandardMaterial {
+        base_color: Color::srgb(0.42, 0.45, 0.40),
+        perceptual_roughness: 1.0,
+        reflectance: 0.1,
+        ..default()
+    });
+    let w = &sim.world;
+    if w.terrain.is_empty() {
+        // Plane3d is authored Y-up, i.e. already Bevy space
+        let size = (ext * 20.0).max(2000.0);
+        commands.spawn((
+            Mesh3d(meshes.add(Plane3d::default().mesh().size(size, size))),
+            MeshMaterial3d(mat),
+            Transform::from_translation(to_bevy([c[0], c[1], z - 0.002])),
+            GroundPlane,
+        ));
+        return;
+    }
+    // one up-facing quad per terrain cell (engine CCW from +z stays CCW from Bevy +y)
+    let top = w.terrain_z.1;
+    let (mut pos, mut idx) = (vec![], vec![]);
+    for (a, b) in &w.terrain {
+        let i = pos.len() as u32;
+        for (x, y) in [(a[0], a[1]), (b[0], a[1]), (b[0], b[1]), (a[0], b[1])] {
+            pos.push(to_bevy([x, y, top]).to_array());
+        }
+        idx.extend_from_slice(&[i, i + 1, i + 2, i, i + 2, i + 3]);
+    }
+    let n = pos.len();
+    let mesh = Mesh::new(bevy::mesh::PrimitiveTopology::TriangleList, bevy::asset::RenderAssetUsages::RENDER_WORLD)
+        .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, pos)
+        .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, vec![[0.0f32, 1.0, 0.0]; n])
+        .with_inserted_indices(bevy::mesh::Indices::U32(idx));
+    commands.spawn((Mesh3d(meshes.add(mesh)), MeshMaterial3d(mat), Transform::default(), GroundPlane));
+}
+
 /// + / - : load the next / previous building from `assets/buildings` (wraps around), resetting
 /// the world and re-framing the camera.
 #[allow(clippy::too_many_arguments)]
@@ -478,6 +509,9 @@ fn cycle_buildings(
     mut rs: ResMut<RenderState>,
     mut fx: ResMut<Fx>,
     mut cams: Query<(&mut Transform, &mut CamCtl, Option<&mut DistanceFog>)>,
+    ground_q: Query<Entity, With<GroundPlane>>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut mats: ResMut<Assets<StandardMaterial>>,
     mut windows: Query<&mut Window, With<PrimaryWindow>>,
     shard_q: Query<Entity, With<shards::Shard>>,
     effect_q: Query<Entity, effects::EffectFilter>,
@@ -503,6 +537,9 @@ fn cycle_buildings(
         }
     };
     *sim = Sim::new(&new_spec);
+    for e in &ground_q {
+        commands.entity(e).despawn();
+    }
     render::clear_entities(&mut commands, &mut rs);
     shards::clear_shards(&mut commands, &shard_q);
     effects::clear_effects(&mut commands, &effect_q);
@@ -515,7 +552,8 @@ fn cycle_buildings(
         new_spec.total_chunks(),
         t0.elapsed().as_secs_f64() * 1e3
     );
-    let (_, ext) = framing(&new_spec);
+    let (c, ext) = framing(&new_spec);
+    spawn_ground(&mut commands, &mut meshes, &mut mats, &sim, c, ext);
     walker.on = false;
     if let Ok((mut xf, mut ctl, fog)) = cams.single_mut() {
         let (c, x) = camera_pose(&new_spec, None, None);

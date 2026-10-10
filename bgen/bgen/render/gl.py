@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from .scene import RenderJob, RenderMesh, Style, key_light_dir, shadow_camera
+from .scene import RenderJob, RenderMesh, Style, ground_cells, key_light_dir, shadow_camera
 
 _VS_MESH = """
 #version 330
@@ -381,15 +381,17 @@ class GLRenderer:
             gr = job.ground_radius if job.ground_radius is not None else max(R, 1.0)
             ext = 12 * gr
             z = job.ground_z - 1e-3
-            q = np.array([[c[0] - ext, c[1] - ext, z], [c[0] + ext, c[1] - ext, z], [c[0] + ext, c[1] + ext, z],
-                          [c[0] - ext, c[1] - ext, z], [c[0] + ext, c[1] + ext, z], [c[0] - ext, c[1] + ext, z]],
-                         np.float32)
+            q = np.array([[[a, b, z], [cx, b, z], [cx, d, z], [a, b, z], [cx, d, z], [a, d, z]]
+                          for a, b, cx, d in ground_cells(c, ext, job.ground_holes)], np.float32).reshape(-1, 3)
+            if q.nbytes > self.g_vbo.size:
+                self.g_vbo = self.ctx.buffer(reserve=q.nbytes)
+                self.vao_ground = self.ctx.vertex_array(self.p_ground, [(self.g_vbo, "3f", "in_pos")])
             self.g_vbo.write(q.tobytes())
             self._set(self.p_ground, ground_col=tuple(st.ground), grid_minor=st.grid_minor,
                       grid_major=st.grid_major, fade_center=(float(c[0]), float(c[1])),
                       fade_r=(1.3 * gr, 3.0 * gr))
             self._setm(self.p_ground, vp=vp)
-            self.vao_ground.render(mgl.TRIANGLES)
+            self.vao_ground.render(mgl.TRIANGLES, vertices=len(q))
         if self.n_idx:
             self._set(self.p_mesh, inner_factor=st.inner_factor, ground_z=job.ground_z)
             self._setm(self.p_mesh, vp=vp)

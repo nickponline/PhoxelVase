@@ -19,7 +19,7 @@ from PIL import Image
 
 from ..export.bld import bitset_to_mask
 from . import plots
-from .scene import (Camera, RenderJob, RenderMesh, Style, build_mesh, fit_camera, floor_levels,
+from .scene import (Camera, RenderJob, RenderMesh, Style, build_mesh, fit_camera, floor_levels, ground_z_of,
                     named_camera, random_chunk_colors)
 
 log = logging.getLogger(__name__)
@@ -105,9 +105,9 @@ def render_view(bd, name: str = "iso_ne", size=(1280, 960), backend: str = "auto
         lo, hi = _xf_bounds(mesh, xforms, visible)
         cam = camera or named_camera(name, lo, hi, r.size)
         job = RenderJob(cam, mesh.base_colors() if colors is None else colors, visible, xforms,
-                        style or Style(), ground_z=min(0.0, float(mesh.bounds[0][2])),
+                        style or Style(), ground_z=ground_z_of(mesh),
                         ground_center=(mesh.bounds[0] + mesh.bounds[1])[:2] / 2,
-                        ground_radius=_radius(mesh))
+                        ground_radius=_radius(mesh), ground_holes=mesh.ground and mesh.ground[1])
         img, mask = r.render(job, world_bounds=(lo, hi))
     finally:
         if own:
@@ -224,7 +224,8 @@ def render_frames(bd, chunk_transforms, out_dir, camera: str | Camera = "iso_ne"
         for f, X in enumerate(chunk_transforms):
             X = np.asarray(X, np.float32)
             vis = None if alive_mask is None else np.asarray(alive_mask[f], bool)
-            job = RenderJob(cam, base_colors, vis, X, Style(), ground_z=0.0, ground_center=gc, ground_radius=gr)
+            job = RenderJob(cam, base_colors, vis, X, Style(), ground_z=ground_z_of(mesh), ground_center=gc, ground_radius=gr,
+                            ground_holes=mesh.ground and mesh.ground[1])
             img, _ = r.render(job, world_bounds=_xf_bounds(mesh, X, vis))
             paths.append(_save(img, out / f"{prefix}_{f:05d}.png"))
     finally:

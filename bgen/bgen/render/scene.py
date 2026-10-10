@@ -42,6 +42,9 @@ class RenderMesh:
     elem_kind: np.ndarray    # (N,) element kind name (str array)
     elem_floor: np.ndarray   # (N,) element floor index (-1 = unknown)
     mass: np.ndarray         # (N,)
+    # (ground level z, (K,4) xy rects [x0,y0,x1,y1] left open): a sunk foundation / basement
+    # sits in pits in the ground; None draws the ground under the lowest point
+    ground: tuple[float, np.ndarray] | None = None
 
     @property
     def bounds(self) -> tuple[np.ndarray, np.ndarray]:
@@ -89,7 +92,42 @@ def build_mesh(bd) -> RenderMesh:
         aabb_max=ch["aabb_max"].astype(np.float64), material=ch["material"].astype(np.int64),
         chunk_flags=ch["flags"].astype(np.int64), elem=ch["elem"].astype(np.int64),
         elem_kind=ekind, elem_floor=efloor, mass=ch["mass"].astype(np.float64),
+        ground=ground_of(bd.meta.get("foundation")),
     )
+
+
+def ground_of(foundation: dict | None, X: np.ndarray | None = None) -> tuple[float, np.ndarray] | None:
+    """RenderMesh.ground from a .bld's foundation meta, posed by the 4x4 `X` (world-axis bounds
+    of each rect, as in rubble's terrain)."""
+    if not foundation:
+        return None
+    X = np.eye(4) if X is None else np.asarray(X, float)
+    R = np.asarray(foundation["rects"], float).reshape(-1, 4)
+    out = []
+    for x0, y0, x1, y1 in R:
+        P = np.array([[x0, y0, 0], [x1, y0, 0], [x1, y1, 0], [x0, y1, 0]]) @ X[:3, :3].T + X[:3, 3]
+        out.append([*P[:, :2].min(0), *P[:, :2].max(0)])
+    return float(foundation["top"]) + float(X[2, 3]), np.array(out, float).reshape(-1, 4)
+
+
+def ground_z_of(mesh: RenderMesh) -> float:
+    return mesh.ground[0] if mesh.ground is not None else min(0.0, float(mesh.bounds[0][2]))
+
+
+def ground_cells(c, ext: float, holes: np.ndarray | None) -> np.ndarray:
+    """(K,4) xy rects tiling the square of half-size `ext` around `c` minus the `holes`."""
+    if holes is None or not len(holes):
+        return np.array([[c[0] - ext, c[1] - ext, c[0] + ext, c[1] + ext]])
+    xs = np.unique(np.clip(np.r_[holes[:, [0, 2]].ravel(), c[0] - ext, c[0] + ext], c[0] - ext, c[0] + ext))
+    ys = np.unique(np.clip(np.r_[holes[:, [1, 3]].ravel(), c[1] - ext, c[1] + ext], c[1] - ext, c[1] + ext))
+    out = []
+    for j in range(len(ys) - 1):
+        ym = 0.5 * (ys[j] + ys[j + 1])
+        for i in range(len(xs) - 1):
+            xm = 0.5 * (xs[i] + xs[i + 1])
+            if not ((holes[:, 0] < xm) & (xm < holes[:, 2]) & (holes[:, 1] < ym) & (ym < holes[:, 3])).any():
+                out.append([xs[i], ys[j], xs[i + 1], ys[j + 1]])
+    return np.array(out, float).reshape(-1, 4)
 
 
 # --------------------------------------------------------------------------- cameras
@@ -266,6 +304,7 @@ class RenderJob:
     ground_z: float = 0.0
     ground_center: np.ndarray | None = None  # xy for the fade
     ground_radius: float | None = None
+    ground_holes: np.ndarray | None = None   # (K,4) xy rects with no ground (foundation pits)
 
 
 def random_chunk_colors(n: int, seed: int = 7) -> np.ndarray:

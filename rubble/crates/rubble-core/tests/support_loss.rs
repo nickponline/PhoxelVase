@@ -134,7 +134,8 @@ fn corner_column(cols: &[(u32, [f32; 2], Vec<u32>)], _: &Bld) -> Vec<u32> {
 }
 
 fn interior_columns(cols: &[(u32, [f32; 2], Vec<u32>)], bld: &Bld) -> Vec<u32> {
-    let (lo, hi) = bld.chunks.iter().fold(([f32::MAX; 2], [f32::MIN; 2]), |(lo, hi), c| {
+    // footprint of the building proper: the foundation below z = 0 is padded beyond it
+    let (lo, hi) = bld.chunks.iter().filter(|c| c.aabb_min[2] >= -0.01).fold(([f32::MAX; 2], [f32::MIN; 2]), |(lo, hi), c| {
         ([lo[0].min(c.com[0]), lo[1].min(c.com[1])], [hi[0].max(c.com[0]), hi[1].max(c.com[1])])
     });
     cols.iter()

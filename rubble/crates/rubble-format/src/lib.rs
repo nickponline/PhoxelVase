@@ -276,4 +276,33 @@ impl Bld {
     pub fn name(&self) -> &str {
         self.meta.get("name").and_then(|v| v.as_str()).unwrap_or("building")
     }
+    /// Local z of the ground this building stands on: the bottom of its foundation, 0 if none.
+    pub fn ground_z(&self) -> f32 {
+        self.meta.get("ground_z").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32
+    }
+    /// The foundation the building stands on (building space), if it has one.
+    pub fn foundation(&self) -> Option<Foundation> {
+        let f = self.meta.get("foundation")?;
+        let num = |v: &serde_json::Value| v.as_f64().map(|x| x as f32);
+        let rects = f
+            .get("rects")?
+            .as_array()?
+            .iter()
+            .map(|r| {
+                let a = r.as_array()?;
+                Some([num(a.first()?)?, num(a.get(1)?)?, num(a.get(2)?)?, num(a.get(3)?)?])
+            })
+            .collect::<Option<Vec<_>>>()?;
+        Some(Foundation { rects, top: num(f.get("top")?)?, bottom: num(f.get("bottom")?)? })
+    }
+}
+
+/// A building's foundation (with any basement over it), sunk into the ground: the
+/// axis-aligned rectangles `[x0, y0, x1, y1]` tiling its outline, ground level `top` around it
+/// and its `bottom`, in building space.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Foundation {
+    pub rects: Vec<[f32; 4]>,
+    pub top: f32,
+    pub bottom: f32,
 }

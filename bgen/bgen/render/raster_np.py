@@ -219,6 +219,9 @@ class NumpyRenderer:
             gq = np.concatenate([gp, np.ones((H, W, 1))], -1) @ VP.T
             gz = gq[..., 2] / gq[..., 3]
             gmask &= ~(bmask & (zbuf < gz))
+            if job.ground_holes is not None:
+                for x0, y0, x1, y1 in job.ground_holes:  # foundation pits: no ground
+                    gmask &= ~((gp[..., 0] > x0) & (gp[..., 0] < x1) & (gp[..., 1] > y0) & (gp[..., 1] < y1))
             if gmask.any():
                 c = job.ground_center if job.ground_center is not None else 0.5 * (lo + hi)[:2]
                 gr = job.ground_radius if job.ground_radius is not None else max(cam.scale, 1.0)

@@ -35,7 +35,7 @@ fn beam_and_settle(name: &str, zf: &[f32], blast: bool) -> Option<FloatingReport
     let (lo, hi) = bounds(&bld);
     let mut w = World::new(WorldConfig::default());
     let b = w.load_building_bld(bld, Isometry::identity());
-    w.add_ground_plane(0.0);
+    w.add_ground_plane(w.foundation_ground_z());
     let c = [(lo[0] + hi[0]) * 0.5, (lo[1] + hi[1]) * 0.5];
     let r = ((hi[0] - lo[0]).powi(2) + (hi[1] - lo[1]).powi(2)).sqrt();
     for &f in zf {

@@ -19,6 +19,8 @@ import numpy as np
 
 from .blockout import build_blockout
 from .export.bld import assemble, write_bld
+from .basement import add_basement
+from .foundation import add_foundation
 from .materials import DEFAULT_MATERIALS, F_ANCHOR, F_COSMETIC_ATTACHED, F_GLASS, F_INDESTRUCTIBLE
 from .model import BuildingContext, BuildingData, ChunkGeom, Edge, Panel
 from .nodes import get_node, get_reserve
@@ -86,7 +88,7 @@ def _fracture_batch(args):
 
 def fracture_all(panels: list[Panel], fracture_cfg: dict, seed: int, jobs: int | None = None) -> list[ChunkGeom]:
     """Fracture every panel with a per-panel RNG; returns chunks grouped by ascending panel id."""
-    cfgs = [dict(fracture_cfg.get(p.material, {}) or {}) for p in panels]
+    cfgs = [{**(fracture_cfg.get(p.material, {}) or {}), **p.tags.get("fracture", {})} for p in panels]
     order = sorted(range(len(panels)), key=lambda i: panels[i].id)
     panels = [panels[i] for i in order]
     cfgs = [cfgs[i] for i in order]
@@ -158,6 +160,11 @@ def run_nodes(spec: dict, seed: int, timings: dict | None = None) -> BuildingCon
         t = time.perf_counter()
         ctx = get_node(name)(ctx, p or {}, node_rng(seed, i, name)) or ctx
         timings[f"node.{name}"] = time.perf_counter() - t
+    basement = add_basement(ctx, rs.get("basement"))
+    ground_z = add_foundation(ctx, rs.get("foundation"), basement)
+    if ground_z is None:
+        ground_z = basement[1] if basement else 0.0
+    ctx.meta["ground_z"] = ground_z
     indestr = set(rs.get("indestructible", []))
     for p in ctx.panels:
         if p.kind in indestr or p.tags.get("role") in indestr:
@@ -177,7 +184,8 @@ def generate(spec: dict, seed: int, jobs: int | None = None, validate: bool = Tr
     timings["fracture"] = time.perf_counter() - t
     t = time.perf_counter()
     if _mark_anchors is not None:
-        _mark_anchors(ctx.panels, chunks)
+        _mark_anchors(ctx.panels, chunks, ground_z=ctx.meta.get("ground_z", 0.0),
+                      pit=ctx.meta.get("foundation") if ctx.meta.get("basement") else None)
     edges = (_build_graph or _fallback_graph)(ctx.panels, chunks)
     orphans = demote_orphan_slivers(chunks, edges)
     timings["graph"] = time.perf_counter() - t
@@ -269,7 +277,9 @@ def build_extra_meta(ctx, chunks, edges) -> dict:
             "room_connectivity": ctx.meta.get("room_connectivity"),
             "stair_cores": [{k: v for k, v in c.items() if k in ("id", "axis", "outer", "inner", "floors")}
                             for c in ctx.meta.get("stair_cores", [])],
-            "floor_z": list(ctx.blockout.floor_z)}
+            "floor_z": list(ctx.blockout.floor_z),
+            "ground_z": ctx.meta.get("ground_z", 0.0),
+            "foundation": ctx.meta.get("foundation")}
 
 
 def out_dir_for(rs_name: str, seed: int, out_root) -> Path:

@@ -15,7 +15,7 @@ buildings:
   - {synthetic: {kind: tower, floors: 4, side: 6.0}, pos: [20,0,0]} # kinds: tower|grid|wall|cantilever|two_box
 steps: 600
 dt: 0.016666
-ground: 0.0            # ground plane height; null = no ground
+ground: auto           # ground plane height; null = no ground; auto (default) = lowest foundation bottom
 config:                # optional partial WorldConfig override (merged into defaults)
   stress: {max_iters: 30}
 actions:
