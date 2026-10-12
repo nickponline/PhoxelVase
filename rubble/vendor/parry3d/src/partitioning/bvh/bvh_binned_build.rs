@@ -287,7 +287,7 @@ impl Bvh {
             }
         };
         if parallel {
-            rayon::join(left, right);
+            let _ = rayon::join(left, right);
         } else {
             left();
             right();
